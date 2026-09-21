@@ -46,11 +46,19 @@ self="$(basename "${here}")"
 OCUDU_BASE="bc7eaab391ab875a6e67f1ee57bff387a1dbfc5f"
 OCUDU_BRANCH="demo-patched"
 
+# Every ref is a commit, not a branch. The SDK builds against the platform's
+# headers, and its main tracks the platform's main TIP, not this pin: on
+# 2026-09-20 it started using equalized_symbols in ocudu_dapp_receiver_metrics_v1
+# and the gnb image stopped compiling against OCUDU_BASE. These three commits
+# are the set the demo was built and measured with. Move them together.
+SDK_BASE="c38255585991ad7005737a4308cd433dee5bcfea"        # 2026-09-02
+GRDAPP_BASE="079cf7189173f9b75090b4736f6a68c1bd8bba0f"     # 2026-09-01
+
 # repo dir | clone URL | ref | patch dir (optional, relative to this script)
 repos=(
   "ocudu|https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-platform.git|${OCUDU_BASE}|patches/ocudu"
-  "ocudu-dapp-sdk|https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-sdk.git|main|"
-  "ocudu-dapp-gnuradio|https://github.com/rajb245/ocudu-dapp-gnuradio.git|main|"
+  "ocudu-dapp-sdk|https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-sdk.git|${SDK_BASE}|"
+  "ocudu-dapp-gnuradio|https://github.com/rajb245/ocudu-dapp-gnuradio.git|${GRDAPP_BASE}|"
 )
 
 # Put <dir> on OCUDU_BRANCH = <ref> + every patch in <patchdir>, and leave it
@@ -124,7 +132,10 @@ for entry in "${repos[@]}"; do
       git clone --quiet "${url}" "${root}/${dir}"
       apply_patches "${dir}" "${ref}" "${patchdir}"
     else
-      git clone --quiet --branch "${ref}" "${url}" "${root}/${dir}"
+      # Not --branch: the ref is a commit, and --branch only takes branch or
+      # tag names. A detached checkout is what we want here.
+      git clone --quiet "${url}" "${root}/${dir}"
+      git -C "${root}/${dir}" checkout --quiet "${ref}"
     fi
   fi
 done
