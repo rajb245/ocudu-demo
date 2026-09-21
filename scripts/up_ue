@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Bring up the over-the-air OAI nrUE. Run this on the machine the B200mini is
+# plugged into, which is NOT the machine running the cell - the two are joined
+# only by RF. The cell must already be on the air (scripts/up over there).
+#
+#   scripts/up_ue                 # external 10 MHz reference (the default here)
+#   UE_EXTRA_ARGS= scripts/up_ue  # no external reference, internal clock
+#   UE_EXTRA_ARGS="--clock-source 1 --tune-offset 1e6" scripts/up_ue
+#
+# This TRANSMITS. scripts/down_ue is the counterpart.
+#
+# --clock-source is an integer, and OAI prints the mapping itself:
+#   "openair0_cfg[0].clock_source == '1' (internal = 0, external = 1)"
+# The line to watch for is "USRP locked to external reference!". A missing or
+# dead 10 MHz shows up there, within a couple of seconds, rather than later as
+# an attach that mysteriously never completes.
+#
+# Everything else the UE needs is in .env: UE_USRP_ARGS, UE_RX_GAIN,
+# UE_TX_GAIN, UE_UHD_IMAGES_DIR. Nothing else belongs on the command line.
+set -uo pipefail
+demo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Default only when unset, so `UE_EXTRA_ARGS= scripts/up_ue` really does mean
+# "no extra arguments" rather than silently getting the default back.
+export UE_EXTRA_ARGS="${UE_EXTRA_ARGS---clock-source 1}"
+echo "UE_EXTRA_ARGS=${UE_EXTRA_ARGS:-(none, internal clock)}"
+
+docker compose -f "${demo}/docker-compose.ue.yml" up -d "$@" || exit 1
+
+C=oai_nr_ue_usrp
+
+# Only look at lines produced from NOW on. Two reasons, both bite hard:
+#   - compose leaves an already-running container alone, so the log still holds
+#     the previous, successful attach. Matching the whole log would report
+#     "PDU session up" for a link that died an hour ago.
+#   - a UE with no cell logs ~170 lines/s while it re-scans. The log reaches
+#     100k lines in minutes and re-reading it costs ~0.4 s, which with six
+#     greps per pass is slower than the poll interval.
+since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+lines() { docker logs --since "${since}" $C 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
+
+# Attach is stochastic: most windows complete in ~10 s, some never do. Print
+# each rung as it is reached rather than everything at the end - two minutes of
+# silence looks like a hang, and where it stops IS the diagnosis, so the reader
+# wants it live.
+echo
+declare -A seen=()
+snap=""
+rung() { # marker | label
+  [[ -n "${seen[$1]:-}" ]] && return
+  grep -qa "$1" <<<"$snap" || return
+  seen[$1]=1
+  printf '  %3ds  %s\n' "$SECONDS" "$2"
+}
+for _ in $(seq 48); do
+  snap="$(lines)"                      # one read per pass, not one per rung
+  rung "locked to external reference"  "reference locked (external 10 MHz)"
+  rung "Initial sync successful"       "initial sync"
+  rung "SIB1 decoded"                  "SIB1 decoded"
+  rung "RA procedure succeeded"        "random access, contention resolved"
+  rung "Registration Accept"           "NAS registration accepted"
+  rung "oaitun_ue1 successfully"       "PDU session up"
+  [[ -n "${seen[oaitun_ue1 successfully]:-}" ]] && break
+  sleep 2.5
+done
+echo
+if [[ -n "${seen[oaitun_ue1 successfully]:-}" ]]; then
+  echo "  attached. Prove the tunnel:  docker exec $C ping -c4 -I oaitun_ue1 10.45.1.1"
+else
+  echo "  NOT attached after 2 min. Where it stopped above tells you what failed:"
+  echo "    no sync            -> downlink: is the cell actually on the air? gains, antennas"
+  echo "    sync but no SIB1   -> downlink quality"
+  echo "    RA but no success  -> Msg3 window, ru_sdr.time_alignment_calibration"
+  echo "    Registration, no tunnel -> the core"
+  echo "  Attach is stochastic. Restart the UE, not the cell:  scripts/down_ue && scripts/up_ue"
+fi

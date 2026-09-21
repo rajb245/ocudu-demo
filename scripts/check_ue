@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Did the UE attach, and is the tunnel actually carrying traffic?
+#
+#   scripts/check_ue
+#
+# Run on the UE host. Works against the over-the-air nrUE (oai_nr_ue_usrp) or
+# the ZMQ one (oai_nr_ue) - it detects which is running. Exit 0 if the UE has
+# a working PDU session, 1 otherwise, so it can gate a script.
+#
+# This is the "what a good attach looks like" slide, as a command. Unlike
+# scripts/up_ue it does not wait: it reports the state right now, so you can
+# run it repeatedly while a demo is live.
+set -uo pipefail
+
+bad=0
+pass() { printf '  \033[32mPASS\033[0m  %-20s %s\n' "$1" "$2"; }
+fail() { printf '  \033[31mFAIL\033[0m  %-20s %s\n' "$1" "$2"; bad=$((bad+1)); }
+info() { printf '  --    %-20s %s\n' "$1" "$2"; }
+
+running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == true ]]; }
+exists()  { docker inspect "$1" >/dev/null 2>&1; }
+
+if   running oai_nr_ue_usrp; then UE=oai_nr_ue_usrp; KIND="over the air (USRP)"
+elif running oai_nr_ue;      then UE=oai_nr_ue;      KIND="ZMQ virtual radio"
+else
+  printf '  \033[31mFAIL\033[0m  %-20s %s\n' "UE container" "not running"
+  echo
+  for c in oai_nr_ue_usrp oai_nr_ue; do
+    exists "$c" || continue
+    printf '  %s exited (code %s, at %s):\n' "$c" \
+      "$(docker inspect -f '{{.State.ExitCode}}' "$c")" \
+      "$(docker inspect -f '{{.State.FinishedAt}}' "$c" | cut -c1-19)"
+    docker logs --tail 6 "$c" 2>&1 | sed 's/\x1b\[[0-9;]*m//g; s/^/      /'
+    echo
+  done
+  echo "  Start it with scripts/up_ue (over the air) or scripts/up zmq on the"
+  echo "  cell host (the ZMQ UE is part of that stack, not a separate script)."
+  exit 1
+fi
+pass "UE container" "${UE} - ${KIND}"
+
+# OAI writes colour escapes; without -a and the sed, grep calls the log binary
+# and prints nothing at all.
+lines() { docker logs "$UE" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
+LOG="$(lines)"
+saw() { grep -qaF "$1" <<<"$LOG"; }
+
+# Everything below this point except the tunnel and the ping is HISTORY: the
+# rungs are log lines from whenever the UE attached, and they stay green long
+# after the link has gone. So establish first whether the link is up NOW.
+# When the cell disappears the UE hits T310, declares radio link failure and
+# loops on initial sync - but it leaves oaitun_ue1 configured, so the interface
+# is not evidence of anything.
+RECENT="$(docker logs --tail 200 "$UE" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+link_lost=0
+if grep -qaE "Initial sync: pbch not decoded|synch Failed|re-sync detection" <<<"$RECENT"; then
+  link_lost=1
+  fail "radio link" "LOST - the UE is re-scanning for the cell, everything below is history"
+fi
+
+# The attach ladder, in order. Where it STOPS is the diagnosis.
+saw "locked to external reference" \
+  && info "clock"           "locked to an external 10 MHz reference" \
+  || info "clock"           "internal (no external reference, or not requested)"
+
+saw "Initial sync successful"   && pass "initial sync"    "PCI $(grep -oaP 'Initial sync successful, PCI: \K[0-9]+' <<<"$LOG" | tail -1)" \
+                                || fail "initial sync"    "no SSB/PBCH - is the cell on the air? gains, antennas"
+saw "SIB1 decoded"              && pass "SIB1"            "decoded" \
+                                || fail "SIB1"            "sync but no SIB1 - downlink quality"
+saw "RA procedure succeeded"    && pass "random access"   "4-step CBRA, contention resolved" \
+                                || fail "random access"   "no RA success - Msg3 window, ru_sdr.time_alignment_calibration"
+saw "Registration Accept"       && pass "NAS registration" "accepted" \
+                                || fail "NAS registration" "no Registration Accept - the core, or the subscriber record"
+
+# The tunnel only exists once the PDU session is up, so its presence IS the
+# end-to-end proof. Read it from the interface, not the log, in case the
+# session came and went.
+ip="$(docker exec "$UE" ip -4 -br addr show oaitun_ue1 2>/dev/null | awk '{print $3}')"
+if [[ -n "$ip" ]]; then
+  pass "PDU session" "oaitun_ue1 up, ${ip}"
+else
+  saw "oaitun_ue1 successfully configured" \
+    && fail "PDU session" "tunnel was configured and is now GONE - session dropped" \
+    || fail "PDU session" "no oaitun_ue1"
+fi
+
+dnn="$(grep -oaP 'DNN \K[A-Za-z0-9._-]+' <<<"$LOG" | tail -1)"
+[[ -n "$dnn" ]] && info "DNN requested" "${dnn}"
+
+# Does it actually carry traffic? A tunnel that pings is the whole claim.
+if [[ -n "$ip" ]]; then
+  if rtt="$(docker exec "$UE" ping -c3 -W2 -I oaitun_ue1 10.45.1.1 2>/dev/null \
+            | grep -oP 'rtt min/avg/max/mdev = \K[^ ]+')"; then
+    pass "tunnel carries traffic" "ping 10.45.1.1 ok, rtt ${rtt} ms"
+  else
+    fail "tunnel carries traffic" "oaitun_ue1 is up but 10.45.1.1 does not answer"
+  fi
+fi
+
+echo
+if (( bad )); then
+  printf '  \033[31m%d check(s) failed\033[0m - the first FAIL above is the one to chase\n' "$bad"
+  if (( link_lost )); then
+    echo "  The UE attached earlier and has lost the cell since."
+    echo "  It will NOT recover on its own. Measured: with the cell back up and"
+    echo "  healthy for 8 minutes the UE kept re-scanning and the gNB saw zero"
+    echo "  RA attempts; a restart then attached in 8 s. Its re-sync loop never"
+    echo "  completes. So after ANY cell bounce, restart the UE:"
+    echo "    scripts/check     # on the gNB host - confirm the cell is back first"
+    echo "    scripts/down_ue && scripts/up_ue"
+  else
+    echo "  Attach is stochastic over the air: restart the UE, not the cell."
+    echo "    scripts/down_ue && scripts/up_ue"
+  fi
+  exit 1
+fi
+printf '  \033[32mall good\033[0m - UE attached with a working PDU session\n'
+echo "  Measure it:    scripts/iperf_ue [seconds]   (uplink then downlink)"

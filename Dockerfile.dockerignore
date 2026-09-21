@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Keep host build trees, git metadata and caches out of the build context.
+# Patterns are anchored: a bare build_* glob would also eat tracked sources
+# such as cmake/modules/build_info.cmake.in.
+**/.git
+ocudu/build
+ocudu/build-*
+ocudu/build_doxygen
+ocudu-dapp-sdk/build
+ocudu-dapp-sdk/build-*
+**/__pycache__
+**/*.pyc

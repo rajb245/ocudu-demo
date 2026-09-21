@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Bring up a cell. Default profile is radio, which drives the X310 and
+# TRANSMITS; pass zmq for the self-contained stack with a virtual radio and no
+# hardware. See scripts/_profiles for the argument handling.
+#
+#   scripts/up            # 5gc + gnb-usrp + gr-dapp-usrp   (needs a USRP)
+#   scripts/up zmq        # 5gc + gnb + oaiue + gr-dapp     (no hardware)
+#   scripts/up zmq ui     # the above plus Grafana on :3300
+#
+# Both compose files are always passed. The CUDA overlay alone has no command,
+# no volumes and no host networking, so compose would silently start the
+# image's default shell and exit 0 with no cell and no error.
+set -euo pipefail
+here="$(dirname "${BASH_SOURCE[0]}")"
+. "${here}/_profiles"
+printf '== %s build (%s)\n' "${CELL_BUILD}" "${CELL_WHY}"
+"${COMPOSE[@]}" up -d ${REST[@]+"${REST[@]}"}
+rc=$?
+
+# The iperf3 servers live in the core, and the core is recreated by every
+# down/up - so they die with it and would have to be restarted by hand after
+# each cell bounce. That is the step that gets forgotten mid-demo, so start
+# them here. Idempotent, and cheap: two listening sockets.
+if (( rc == 0 )) && [[ "$(docker inspect -f '{{.State.Running}}' ocudu_demo_5gc 2>/dev/null)" == true ]]; then
+  "${here}/iperf_server" >/dev/null 2>&1 \
+    && echo "== iperf3 servers ready in the core (ports 7201/7202) - scripts/iperf_ue on the UE host" \
+    || echo "== note: could not start the iperf3 servers; run scripts/iperf_server by hand" >&2
+fi
+exit $rc

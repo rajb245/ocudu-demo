@@ -1,0 +1,345 @@
+# SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+#
+# OCUDU dApp/E3 demo: Open5GS 5GC + OCUDU gNB (dApp runtime, E3 plane) + OAI
+# nrUE over a ZeroMQ virtual radio. One cell, one UE, no radio hardware.
+#
+#   docker compose -f demo/docker-compose.yml up -d            # core + cell + UE
+#   docker compose -f demo/docker-compose.yml --profile ui up -d   # + Grafana
+#   docker compose -f demo/docker-compose.yml -f demo/docker-compose.cuda.yml up -d
+#
+# Run it from the workspace root (the directory holding ocudu/,
+# ocudu-dapp-sdk/ and demo/).
+
+name: ocudu-demo
+
+services:
+  # --------------------------------------------------------------------
+  # Open5GS 5G core, built unchanged from the public platform's own docker/
+  # tree (the same files srsRAN shipped; the project moved to OCUDU in 2025).
+  5gc:
+    container_name: ocudu_demo_5gc
+    image: ocudu-demo/5gc
+    build:
+      context: ../ocudu/docker/open5gs
+      target: open5gs
+      args:
+        OS_VERSION: "22.04"
+        OPEN5GS_VERSION: "v2.7.0"
+    env_file:
+      - ../ocudu/docker/open5gs/open5gs.env
+    environment:
+      # One subscriber, matching configs/nrue_zmq.conf and nrue_usrp_n78.conf.
+      # add_users.py takes either a path ending in .csv or this inline form:
+      #   imsi,key,op_type,op/opc,amf,qci,ip_alloc
+      # It registers the APN from its own default, which upstream is
+      # "internet" - that is why both UE configs ask for that DNN.
+      SUBSCRIBER_DB: "001010123456789,00112233445566778899aabbccddeeff,opc,63bfa50ee6523365ff14c1f45f88737d,9001,9,10.45.1.2"
+    privileged: true
+    ports:
+      - "9999:9999/tcp"
+    command: 5gc -c open5gs-5gc.yml
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.20 7777"]
+      interval: 3s
+      timeout: 1s
+      retries: 60
+    networks:
+      ran:
+        ipv4_address: ${OPEN5GS_IP}
+
+  # --------------------------------------------------------------------
+  # OCUDU gNB: ZMQ radio, dApp runtime, embedded E3 management + telemetry.
+  gnb:
+    container_name: ocudu_demo_gnb
+    image: ${GNB_IMAGE}
+    # The ZMQ cell and the USRP cell are alternatives, never both: two gNBs
+    # against one core, and only one can own the cell. COMPOSE_PROFILES=zmq in
+    # .env makes this the default, and a CLI --profile REPLACES that value
+    # rather than adding to it, so "--profile radio up" excludes these two.
+    profiles: [zmq]
+    build:
+      context: ..
+      dockerfile: ${DEMO_DIR:-demo}/Dockerfile
+      target: release
+      additional_contexts:
+        # this directory, so the Dockerfile can COPY out of it without
+        # knowing what it is called
+        demo: .
+      args:
+        BASE_IMAGE: ${GNB_BASE_IMAGE}
+        OCUDU_ENABLE_CUDA: ${GNB_ENABLE_CUDA}
+        OCUDU_CUDA_ARCHITECTURES: ${OCUDU_CUDA_ARCHITECTURES}
+        OCUDU_JOBS: ${NUM_JOBS}
+        OCUDU_MARCH: ${OCUDU_MARCH}
+        OCUDU_BUILD_TYPE: ${OCUDU_BUILD_TYPE}
+    environment:
+      OAIUE_IP: ${OAIUE_IP}
+    # The preflight helper refuses to harden when its parent is PID 1 (it
+    # guards against having been reparented to init). Without an init process
+    # the gNB *is* PID 1, so every dApp load fails "sandbox setup failed".
+    init: true
+    cap_add:
+      - NET_ADMIN        # for veth-sctp-crc-off (see command)
+      - SYS_NICE
+      - CAP_SYS_PTRACE
+    ulimits:
+      memlock: -1
+    volumes:
+      - ./configs/gnb_zmq_tdd_n78_20mhz_dapp.yml:/etc/ocudu/gnb.yml:ro
+      - gnb-storage:/tmp
+    ports:
+      - "36423:36423/sctp"   # E3AP management + telemetry
+      - "38472:38472/sctp"   # E3 data profile (FlatBuffers)
+      - "8001:8001/tcp"      # metrics websocket / remote control
+    networks:
+      ran:
+        ipv4_address: ${GNB_IP}
+      metrics:
+        ipv4_address: 172.19.1.3
+    depends_on:
+      5gc:
+        condition: service_healthy
+    # The gNB does not expand environment variables inside its YAML, so the UE
+    # hostname is resolved to an address before the config is handed over.
+    # veth-sctp-crc-off first: on old kernels the gNB's E3AP replies leave
+    # this container with an uncomputed SCTP CRC and every client in another
+    # container times out (scripts/veth-sctp-crc-off.sh). It needs NET_ADMIN.
+    command:
+      - bash
+      - -c
+      - veth-sctp-crc-off; rm -f /run/ocudu/dapp-management.sock; sed "s/oai_nr_ue/$${OAIUE_IP}/g" /etc/ocudu/gnb.yml > /tmp/gnb.run.yml && exec gnb -c /tmp/gnb.run.yml
+
+  # --------------------------------------------------------------------
+  # OAI nrUE over ZMQ, built against the Duranta OAI fork; the source is
+  # fetched by BuildKit as a remote build context.
+  oaiue:
+    container_name: oai_nr_ue
+    image: ocudu-demo/oai-nr-ue
+    # ZMQ only: this UE speaks oai_zmqdevif over TCP and cannot reach a gNB
+    # that is transmitting from a USRP. An over-the-air cell needs a UE with
+    # its own radio, or a COTS handset with a provisioned SIM.
+    profiles: [zmq]
+    build:
+      context: .
+      dockerfile: Dockerfile.oaiue
+      target: demo
+      additional_contexts:
+        src: ${OAIUE_REPO}#${OAIUE_BRANCH}
+      args:
+        OS_VERSION: "24.04"
+        TARGET: builder
+        NUM_JOBS: ${NUM_JOBS}
+    environment:
+      GNB_IP: ${GNB_IP}
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    devices:
+      - /dev/net/tun
+    volumes:
+      - ./configs/nrue_zmq.conf:/nrue.conf:ro
+      - ./configs/uecap_ports1.xml:/uecap_ports1.xml:ro
+    networks:
+      ran:
+        ipv4_address: ${OAIUE_IP}
+    depends_on:
+      gnb:
+        condition: service_started
+    # Same hostname substitution as the gNB, plus a short wait for the cell to
+    # come on the air before the UE starts scanning.
+    command:
+      - bash
+      - -c
+      # nr-uesoftmodem dlopen()s its config and device plugins by bare name, so
+      # it has to run with the build directory on the library path.
+      - sleep 15 && sed "s/ocudu_gnb/$${GNB_IP}/g" /nrue.conf > /tmp/nrue.run.conf &&
+        cd /tmp/ran_build/build &&
+        LD_LIBRARY_PATH=/tmp/ran_build/build exec ./nr-uesoftmodem -O /tmp/nrue.run.conf ${UE_EXTRA_ARGS:-}
+
+  # --------------------------------------------------------------------
+  # Split-8 cell on a real USRP (Ettus X310 and friends), opt-in.
+  #
+  #   docker compose -f demo/docker-compose.yml --profile radio up gnb-usrp
+  #
+  # Host networking because a network-attached USRP is reached over the host's
+  # 10 GbE link, not through a docker bridge. The 5gc service stays on the ran
+  # network and is reachable from the host at its container address.
+  #
+  # Real-time caveat, stated plainly: this sets rtprio and memlock and pins
+  # nothing. For timing-sensitive work run the same binary on the bare host, or
+  # add cpuset pinning and isolated cores here. The container is for bring-up.
+  gnb-usrp:
+    container_name: ocudu_demo_gnb_usrp
+    image: ${GNB_IMAGE}
+    profiles: [radio]
+    init: true
+    network_mode: host
+    cap_add:
+      - SYS_NICE
+      - CAP_SYS_PTRACE
+    ulimits:
+      rtprio: 97
+      memlock: -1
+    volumes:
+      - ./configs/gnb_rf_x310_tdd_n78_20mhz_dapp.yml:/etc/ocudu/gnb.yml:ro
+      - gnb-storage:/tmp
+    depends_on:
+      5gc:
+        condition: service_healthy
+    # A gNB that dies leaves /run/ocudu/dapp-management.sock behind in the
+    # container filesystem, and the next start of the same container fails
+    # with "local management socket path already exists". Clear it first.
+    command:
+      - bash
+      - -c
+      - rm -f /run/ocudu/dapp-management.sock; exec gnb -c /etc/ocudu/gnb.yml
+
+  # --------------------------------------------------------------------
+  # GNU Radio Class-C observer dApp (github.com/rajb245/ocudu-dapp-gnuradio).
+  # Subscribes to the gNB's live uplink resource grid over E3AP (sctp/36423,
+  # stream classc.spectrum) and runs it through GNU Radio blocks. It is a plain
+  # SCTP client: no manifest, no signing, nothing loaded into the gNB. The
+  # portable E3 spectrum route exists whenever e3ap_sctp is configured, and it
+  # goes live the moment a subscriber attaches - the reference spectrum dApp in
+  # the catalog does not need to be activated for this to flow.
+  #
+  # An idle cell prints nothing but a clean floor; detections appear in the
+  # PRBs the scheduler grants once a UE is pushing uplink traffic (iperf3 -R
+  # from the UE, or just the attach itself). GRDAPP_SCRIPT selects the example
+  # (spectrum_threshold_dapp.py | fsk_demod_dapp.py), GRDAPP_ARGS passes its
+  # options through, e.g. GRDAPP_ARGS="--threshold-db 12 --maximum 50".
+  gr-dapp:
+    container_name: ocudu_demo_grdapp
+    image: ocudu-demo/gr-dapp
+    profiles: [zmq]
+    build:
+      context: ..
+      dockerfile: ${DEMO_DIR:-demo}/Dockerfile.grdapp
+    depends_on: [gnb]
+    # The gNB's E3AP listener comes up a few seconds after the container; the
+    # client exits non-zero on a refused association, so let compose retry.
+    restart: on-failure
+    # Fixed address: without one this container can grab the UE's OAIUE_IP if it
+    # starts first, and the UE then fails with "Address already in use".
+    networks:
+      ran:
+        ipv4_address: ${GRDAPP_IP}
+    command: ["sh", "-c", "exec python3 ${GRDAPP_SCRIPT:-spectrum_threshold_dapp.py} --host ${GNB_IP} --port 36423 ${GRDAPP_ARGS:-}"]
+
+  # Same consumer for the over-the-air cell: gnb-usrp is on the host network
+  # with E3AP bound to 127.0.0.1, so this joins the host network too.
+  gr-dapp-usrp:
+    container_name: ocudu_demo_grdapp_usrp
+    image: ocudu-demo/gr-dapp
+    profiles: [radio]
+    build:
+      context: ..
+      dockerfile: ${DEMO_DIR:-demo}/Dockerfile.grdapp
+    depends_on: [gnb-usrp]
+    restart: on-failure
+    network_mode: host
+    command: ["sh", "-c", "exec python3 ${GRDAPP_SCRIPT:-spectrum_threshold_dapp.py} --host 127.0.0.1 --port 36423 ${GRDAPP_ARGS:-}"]
+
+  # --------------------------------------------------------------------
+  # Build gates, run against the image rather than inside it. For the CUDA
+  # image these are the only place they can run at all: the binaries need
+  # libcuda.so.1 from the host driver.
+  #
+  #   docker compose -f demo/docker-compose.yml --profile gates run --rm gates
+  gates:
+    image: ${GNB_IMAGE}
+    profiles: [gates]
+    init: true
+    command:
+      - bash
+      - -c
+      - cd /work/ocudu/build &&
+        ./tests/unittests/dapp/dapp_runtime_test
+          --gtest_filter=-dapp_class_c_process_supervisor.requires_seccomp_filter_before_route_admission_when_configured &&
+        OCUDU_E3_SCHEMA_DIR=/work/ocudu/schemas/e3
+        python3 /work/ocudu/python/tests/test_e3ap_client.py
+          --server /work/ocudu/build/tests/unittests/dapp/e3ap_test_server
+
+  # --------------------------------------------------------------------
+  # Metrics UI (opt-in): gNB websocket -> telegraf -> InfluxDB -> Grafana.
+  telegraf:
+    container_name: ocudu_demo_telegraf
+    image: ocudu-demo/telegraf
+    profiles: [ui]
+    build:
+      context: ../ocudu/docker/telegraf
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    env_file:
+      - ./metrics.env
+    networks:
+      metrics:
+        ipv4_address: 172.19.1.4
+
+  influxdb:
+    container_name: ocudu_demo_influxdb
+    image: influxdb:${INFLUXDB3_VERSION}
+    profiles: [ui]
+    user: "0:0"
+    volumes:
+      - influxdb-storage:/var/lib/influxdb3:rw
+    env_file:
+      - ./metrics.env
+    environment:
+      - LOG_FILTER=${INFLUXDB3_LOG_LEVEL}
+    command: >
+      --object-store=memory --data-dir=/var/lib/influxdb3
+      --plugin-dir=/var/lib/influxdb3-plugins --node-id="${INFLUXDB_NODE_ID:-node0}"
+      --http-bind="${INFLUXDB3_HTTP_BIND_ADDR}" --without-auth
+    restart: on-failure:10
+    healthcheck:
+      test: curl -f ${INFLUXDB3_HOST_URL}/health
+      timeout: 5s
+      interval: 1s
+    networks:
+      metrics:
+        ipv4_address: 172.19.1.5
+
+  grafana:
+    container_name: ocudu_demo_grafana
+    image: ocudu-demo/grafana
+    profiles: [ui]
+    build:
+      context: ../ocudu/docker/grafana
+      args:
+        # The Dockerfile's arg is LOGO_SRC and it defaults to the OCUDU mark;
+        # we passed LOGO_URL here for a while, which matches nothing and was
+        # silently ignored. Left unset on purpose.
+        GF_VERSION: ${GF_VERSION}
+    volumes:
+      - grafana-storage:/var/lib/grafana:rw
+    env_file:
+      - ./metrics.env
+    depends_on:
+      telegraf:
+        condition: service_started
+    ports:
+      - "3300:${GF_PORT}"
+    networks:
+      metrics:
+        ipv4_address: 172.19.1.6
+
+volumes:
+  gnb-storage:
+  grafana-storage:
+  influxdb-storage:
+
+networks:
+  ran:
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.53.1.0/24
+  metrics:
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.19.1.0/24

@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Shared by up_e3 / down_e3. Works against whichever cell is already running:
+# the USRP cell (radio profile) or the ZMQ one. Never touches the cell itself.
+demo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CUDA="-f ${demo}/docker-compose.yml -f ${demo}/docker-compose.cuda.yml"
+
+running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == true ]]; }
+
+if running ocudu_demo_gnb_usrp; then
+  GNB=ocudu_demo_gnb_usrp; DAPP=ocudu_demo_grdapp_usrp; SVC=gr-dapp-usrp; PROFILE=radio
+elif running ocudu_demo_gnb; then
+  GNB=ocudu_demo_gnb;      DAPP=ocudu_demo_grdapp;      SVC=gr-dapp;      PROFILE=zmq
+else
+  echo "no cell is running - start one with ./up" >&2
+  exit 1
+fi
+
+CO=(docker compose $CUDA --profile "$PROFILE")
+subs() { docker exec $GNB ocudu-dappctl inventory 2>/dev/null | grep -c '^  subscription'; }
+det()  { docker logs $DAPP 2>/dev/null | grep -ac '"prb"'; }

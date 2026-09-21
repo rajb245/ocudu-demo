@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Shared by scripts/up and scripts/down: turn leading profile names into
+# --profile flags and leave everything else for compose.
+#
+#   scripts/up            radio (the default: over-the-air cell, TRANSMITS)
+#   scripts/up zmq        the self-contained stack, virtual radio, no hardware
+#   scripts/up zmq ui     add Grafana
+#   scripts/up zmq --build
+#
+# A CLI --profile REPLACES COMPOSE_PROFILES from .env rather than adding to
+# it, so naming one here is what selects the cell.
+demo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KNOWN_PROFILES="zmq radio ui gates"
+
+PROFILE_FLAGS=()
+while (( $# )); do
+  case "$1" in
+    --cpu)  CELL_BUILD=cpu;  CELL_WHY="--cpu given";  shift; continue ;;
+    --cuda) CELL_BUILD=cuda; CELL_WHY="--cuda given"; shift; continue ;;
+  esac
+  case " ${KNOWN_PROFILES} " in
+    *" $1 "*) PROFILE_FLAGS+=(--profile "$1"); shift ;;
+    *)        break ;;
+  esac
+done
+# A typo would otherwise start only the profile-less services - just the core -
+# which looks like a broken stack rather than a bad argument.
+# What to use when no profile is named. up wants one cell; down wants to clean
+# up whatever is there, so it sets DEFAULT_PROFILES=all before sourcing this.
+default_profiles="${DEFAULT_PROFILES:-radio}"
+[[ "${default_profiles}" == all ]] && default_profiles="${KNOWN_PROFILES}"
+
+if (( ${#PROFILE_FLAGS[@]} == 0 )); then
+  if [[ "${1:-}" == -* || $# -eq 0 ]]; then
+    for _p in ${default_profiles}; do PROFILE_FLAGS+=(--profile "${_p}"); done
+  else
+    echo "unknown profile '$1' - expected one of: ${KNOWN_PROFILES}" >&2
+    exit 2
+  fi
+fi
+# Sourcing restores the caller's positional parameters when it returns, so
+# the shifts above do NOT reach them. Hand back what is left explicitly, or
+# the profile name is passed on to compose as a service name.
+REST=("$@")
+# --- CPU or CUDA -----------------------------------------------------------
+# The overlay swaps the gNB onto a CUDA base and a different tag, so getting
+# this wrong is not a slow build, it is "pull access denied for ocudu-demo/gnb"
+# on an image that was never built. Decide, do not assume.
+#
+# Order matters. What is BUILT beats what the hardware could do: picking CUDA
+# on a box that only has gnb:cpu means a surprise 20-minute build, and picking
+# CPU on a box that only has gnb:cuda means the same in reverse.
+#   1. an explicit --cpu / --cuda wins
+#   2. if exactly one of the two images exists, use that one
+#   3. otherwise fall back to whether docker can actually drive the GPU
+has_img() { docker image inspect "$1" >/dev/null 2>&1; }
+cuda_viable() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  docker run --rm --gpus all ubuntu:24.04 true >/dev/null 2>&1 || return 1
+  # The default CUDA 13 base image needs r580 or newer.
+  local drv; drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
+  [[ -n "${drv}" ]] && (( ${drv%%.*} >= 580 ))
+}
+
+if [[ -z "${CELL_BUILD:-}" ]]; then
+  if   has_img ocudu-demo/gnb:cuda && ! has_img ocudu-demo/gnb:cpu;  then CELL_BUILD=cuda; CELL_WHY="only gnb:cuda is built"
+  elif has_img ocudu-demo/gnb:cpu  && ! has_img ocudu-demo/gnb:cuda; then CELL_BUILD=cpu;  CELL_WHY="only gnb:cpu is built"
+  elif cuda_viable; then CELL_BUILD=cuda; CELL_WHY="docker can drive this GPU"
+  else                   CELL_BUILD=cpu;  CELL_WHY="no GPU docker can use"
+  fi
+fi
+
+# CELL_BUILD may arrive preset from the environment, in which case nothing
+# above ran and CELL_WHY is unset - which would abort under set -u.
+CELL_WHY="${CELL_WHY:-CELL_BUILD=${CELL_BUILD} in the environment}"
+
+COMPOSE_FILES=(-f "${demo}/docker-compose.yml")
+[[ "${CELL_BUILD}" == cuda ]] && COMPOSE_FILES+=(-f "${demo}/docker-compose.cuda.yml")
+COMPOSE=(docker compose "${COMPOSE_FILES[@]}" "${PROFILE_FLAGS[@]}")

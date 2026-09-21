@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Stop the live E3 spectrum stream. Leaves the cell running.
+#
+# Dropping the subscription stops the gNB publishing the grid, so this is the
+# other half of the demo: the cost of the stream is only paid while someone is
+# listening.
+. "$(dirname "${BASH_SOURCE[0]}")/_e3_common"
+
+before=$(det)
+echo "cell: $GNB ($PROFILE)   subscriptions before: $(subs)   detections so far: $before"
+"${CO[@]}" stop "$SVC" >/dev/null 2>&1
+sleep 2
+echo "subscriptions now: $(subs)   (cell still up: $(running $GNB && echo yes || echo NO))"

@@ -1,0 +1,111 @@
+From 837a3164938dcd9d86dac5c6e75c937b713eba06 Mon Sep 17 00:00:00 2001
+From: Raj Bhattacharjea <rbhattacharjea@deepsig.io>
+Date: Fri, 18 Sep 2026 14:28:35 -0400
+Subject: [PATCH 2/2] phy/cuda: apply prach_th_correction_factor in the
+ accelerated PRACH detector
+
+The accelerated factory handed expert_phy.prach_th_correction_factor only
+to the CPU fallback; prach_detector_cuda_impl used the raw threshold from
+the table. So enabling prach_acceleration_mode silently reverted the
+false-alarm suppression the factor exists for.
+
+Measured on the X310 cell with the factor set to 4.0, PRACH acceleration
+auto and no UE transmitting anywhere: 23 RARs to 23 different RNTIs in
+3.5 minutes, none of which reached UE creation or contention resolution -
+the {format 0, ZCZ 0, 1 port} entry is the lowest in the table and flagged
+unvalidated, so noise triggers detections and each one is answered. The
+generic detector scales the same threshold and does not do this.
+
+Scale it in compute_geometry(), exactly as prach_detector_generic_impl
+does, and pass the configured value through the factory.
+
+(cherry picked from commit a91c2abeefe57fc420b39a2728bc7a5add8f8765)
+---
+ .../upper/channel_processors/prach/factories.cpp   |  8 ++++++--
+ .../prach/prach_detector_cuda_impl.cpp             | 14 ++++++++++++--
+ .../prach/prach_detector_cuda_impl.h               |  6 +++++-
+ 3 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/lib/phy/upper/channel_processors/prach/factories.cpp b/lib/phy/upper/channel_processors/prach/factories.cpp
+index 293394207b..cc3a62b590 100644
+--- a/lib/phy/upper/channel_processors/prach/factories.cpp
++++ b/lib/phy/upper/channel_processors/prach/factories.cpp
+@@ -139,8 +139,12 @@ public:
+     warmup.nof_rx_ports          = config.warmup_nof_rx_ports;
+     warmup.long_format           = config.warmup_long_format;
+     warmup.zero_correlation_zone = config.warmup_zero_correlation_zone;
+-    return std::make_unique<prach_detector_cuda_impl>(
+-        prach_gen_factory->create(), std::move(fallback), force_gpu_path, nvcuda_device_id, warmup);
++    return std::make_unique<prach_detector_cuda_impl>(prach_gen_factory->create(),
++                                                      std::move(fallback),
++                                                      force_gpu_path,
++                                                      nvcuda_device_id,
++                                                      warmup,
++                                                      config.threshold_scaling);
+   }
+ 
+   std::unique_ptr<prach_detector_validator> create_validator() override
+diff --git a/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.cpp b/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.cpp
+index 7ec41b1b50..f4a3b46d12 100644
+--- a/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.cpp
++++ b/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.cpp
+@@ -80,12 +80,17 @@ prach_detector_cuda_impl::prach_detector_cuda_impl(std::unique_ptr<prach_generat
+                                                    std::unique_ptr<prach_detector>  fallback_,
+                                                    bool                             force_gpu_path_,
+                                                    int                              cuda_device_id_,
+-                                                   warmup_configuration             warmup) :
++                                                   warmup_configuration             warmup,
++                                                   float                            threshold_scaling_) :
+   generator(std::move(generator_)),
+   fallback(std::move(fallback_)),
++  threshold_scaling(threshold_scaling_),
+   force_gpu_path(force_gpu_path_),
+   device_id(cuda_device_id_)
+ {
++  ocudu_assert(threshold_scaling >= 0.0F,
++               "The PRACH threshold scaling factor should be a nonnegative number, given {}.",
++               threshold_scaling);
+   ocudu_assert(generator, "Invalid PRACH generator.");
+   ocudu_assert(fallback, "Invalid fallback PRACH detector.");
+ 
+@@ -272,7 +277,12 @@ prach_detector_cuda_impl::compute_geometry(const prach_detector::configuration&
+   th_params.format                              = config.format;
+   th_params.zero_correlation_zone               = config.zero_correlation_zone;
+   auto [threshold, combine_symbols, win_margin] = detail::get_threshold_and_margin(th_params);
+-  geometry.threshold                            = threshold;
++  // Scale the threshold exactly as prach_detector_generic_impl does. Without this the accelerated detector runs on
++  // the raw table value, and expert_phy.prach_th_correction_factor silently stops applying as soon as PRACH
++  // acceleration is enabled. The {format 0, ZCZ 0, 1 port} entry is the lowest in the table and flagged
++  // unvalidated: over the air on an X310 it produced ~7 detections per minute, each answered with a RAR, with no
++  // UE transmitting at all.
++  geometry.threshold                            = threshold * threshold_scaling;
+   geometry.combine_symbols                      = combine_symbols;
+   geometry.win_margin                           = win_margin;
+   geometry.max_delay_samples =
+diff --git a/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.h b/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.h
+index 521f10f8bf..11e4e44adf 100644
+--- a/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.h
++++ b/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.h
+@@ -29,7 +29,8 @@ public:
+                            std::unique_ptr<prach_detector>  fallback_,
+                            bool                             force_gpu_path_,
+                            int                              cuda_device_id_,
+-                           warmup_configuration             warmup);
++                           warmup_configuration             warmup,
++                           float                            threshold_scaling_ = 1.0F);
+ 
+   ~prach_detector_cuda_impl() override;
+ 
+@@ -65,6 +66,9 @@ private:
+ 
+   std::unique_ptr<prach_generator> generator;
+   std::unique_ptr<prach_detector>  fallback;
++  /// Multiplies the detection threshold from the threshold table, as the generic detector does. Configured with
++  /// expert_phy.prach_th_correction_factor; 1.0 leaves the table value untouched.
++  float                            threshold_scaling = 1.0F;
+   bool                             force_gpu_path = false;
+   bool                             gpu_available  = false;
+   int                              device_id      = 0;
+-- 
+2.43.0
+

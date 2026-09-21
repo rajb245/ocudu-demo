@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Measure throughput over the UE's tunnel, uplink then downlink.
+#
+#   scripts/iperf_ue [seconds]        # default 20
+#
+# Run on the UE host. The iperf3 servers live in the CORE container, which on
+# an over-the-air setup is on the other machine - so if the core is not local
+# this prints the one command to run there and stops, rather than failing with
+# "connection refused" and leaving you to work out why.
+#
+# Two ports because -R reuses the control connection: one server per direction,
+# each -1 so it exits after a single test and leaves nothing running.
+set -uo pipefail
+secs="${1:-20}"
+
+running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == true ]]; }
+
+if   running oai_nr_ue_usrp; then UE=oai_nr_ue_usrp
+elif running oai_nr_ue;      then UE=oai_nr_ue
+else echo "no UE container running - scripts/up_ue" >&2; exit 1; fi
+
+ue_ip="$(docker exec "$UE" ip -4 -br addr show oaitun_ue1 2>/dev/null | awk '{print $3}')"
+ue_ip="${ue_ip%%/*}"
+[[ -n "$ue_ip" ]] || { echo "no oaitun_ue1 on ${UE} - not attached. scripts/check_ue" >&2; exit 1; }
+
+CORE_IP=10.45.1.1
+# Delegate to the gNB-host script so there is one definition of how the
+# servers are started, and it is idempotent.
+start_servers() { "$(dirname "${BASH_SOURCE[0]}")/iperf_server" >/dev/null 2>&1; }
+# Deliberately NO reachability probe first. The servers are started -1, so a
+# probe that opens a TCP connection IS their one client and they exit before
+# iperf3 arrives - which cost a run to find. If the core is elsewhere, just
+# try, and explain on refusal.
+running ocudu_demo_5gc && start_servers
+
+hint() {
+  cat <<EOF
+
+Nothing is listening on ${CORE_IP}. The iperf3 servers live in the core, which
+on an over-the-air setup is on the gNB host. Run this there, once:
+
+  scripts/iperf_server
+
+They stay up, so you only need that once per cell. Then re-run this.
+EOF
+}
+
+run() { # port | extra | label
+  local out
+  out="$(docker exec "$UE" iperf3 -c "$CORE_IP" -B "$ue_ip" -p "$1" -t "$secs" $2 2>&1)"
+  local bw retr
+  bw="$(grep -E 'sender|receiver' <<<"$out" | tail -2 | head -1 | grep -oP '[0-9.]+ [KMG]bits/sec' | tail -1)"
+  retr="$(grep -oP '\s\K[0-9]+(?=\s+sender)' <<<"$out" | tail -1)"
+  if [[ -z "$bw" ]]; then
+    printf '  %-10s FAILED\n' "$3"
+    grep -iE 'error|refused|unable|denied' <<<"$out" | head -2 | sed 's/^/       /'
+    if grep -qi refused <<<"$out"; then hint; return 2; fi
+    return 1
+  fi
+  printf '  %-10s %-14s %s\n' "$3" "$bw" "${retr:+retransmits ${retr}}"
+}
+
+echo "UE ${UE} ${ue_ip} -> core ${CORE_IP}, ${secs}s each way"
+bad=0
+run 7201 ""   "uplink"   || bad=$?
+# A refused uplink means no servers at all; running the downlink would just
+# print the same hint again.
+(( bad == 2 )) && exit 1
+run 7202 "-R" "downlink" || bad=1
+exit $(( bad ? 1 : 0 ))

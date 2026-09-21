@@ -1,0 +1,4 @@
+# Nothing here is generated, but keep stray local state out.
+*.log
+*.swp
+__pycache__/

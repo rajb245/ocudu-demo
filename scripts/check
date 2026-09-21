@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Is the cell healthy? Works against the USRP cell or the ZMQ one - it
+# detects which is running. One verdict line at the end.
+#
+#   scripts/up && sleep 20 && scripts/check
+#
+# Exit 0 if every required check passed, 1 otherwise, so it can gate a script.
+# Lines marked "--" are informational and never change the verdict: they
+# depend on whether a UE happens to be attached right now.
+#
+# Two things about where the cell writes, because they trip everyone up:
+#   - the cell log is a FILE INSIDE the container, /tmp/gnb.log, and it runs at
+#     all_level: warning (mac_level: info), so most of it is quiet by design.
+#   - the metrics TABLE and UHD's own lines go to docker logs. The gNB's stdout
+#     is block-buffered (no TTY on a compose service), so the table arrives in
+#     bursts of ~29 rows every ~30 s. UHD logs to stderr and is immediate.
+
+demo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+self="$(basename "${demo}")"
+CORE=ocudu_demo_5gc
+
+bad=0
+pass() { printf '  \033[32mPASS\033[0m  %-20s %s\n' "$1" "$2"; }
+fail() { printf '  \033[31mFAIL\033[0m  %-20s %s\n' "$1" "$2"; bad=$((bad+1)); }
+info() { printf '  --    %-20s %s\n' "$1" "$2"; }
+
+running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == true ]]; }
+exists()  { docker inspect "$1" >/dev/null 2>&1; }
+
+# 0. Which cell is this? The USRP one or the ZMQ one - every check below
+#    applies to both, only the container names differ.
+if   running ocudu_demo_gnb_usrp; then GNB=ocudu_demo_gnb_usrp; DAPP=ocudu_demo_grdapp_usrp; CELL=radio
+elif running ocudu_demo_gnb;      then GNB=ocudu_demo_gnb;      DAPP=ocudu_demo_grdapp;      CELL=zmq
+else                                   GNB=""; DAPP=""; CELL=""
+fi
+
+# Everything below runs inside the gNB, so stop here if it is not up - a wall
+# of "No such container" is not a diagnosis.
+if [[ -n "$GNB" ]] && running "$CORE"; then
+  state=""
+  for pair in "core:$CORE" "gnb:$GNB" "dapp:$DAPP"; do
+    short=${pair%%:*}; name=${pair#*:}
+    if running "$name"; then
+      h="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$name" 2>/dev/null)"
+      state+="${short}${h:+ ($h)}, "
+    else
+      state+="${short} DOWN, "
+    fi
+  done
+  pass containers "${state%, } (${CELL} cell)"
+else
+  printf '  \033[31mFAIL\033[0m  %-20s %s\n' containers \
+    "core $(running $CORE && echo up || echo DOWN), no cell running"
+  echo
+
+  # A container that EXITED is a different problem from one that was never
+  # started, and it is the one with evidence attached. Say which, and show it.
+  crashed=0
+  for c in ocudu_demo_gnb_usrp ocudu_demo_gnb; do
+    exists "$c" || continue
+    running "$c" && continue
+    crashed=1
+    printf '  %s exited (code %s, at %s):\n' "$c" \
+      "$(docker inspect -f '{{.State.ExitCode}}' "$c")" \
+      "$(docker inspect -f '{{.State.FinishedAt}}' "$c" | cut -c1-19)"
+    docker logs --tail 6 "$c" 2>&1 | sed 's/^/      /'
+    echo
+  done
+
+  if (( crashed )); then
+    echo "  The cell started and then died, so scripts/up will not help until the"
+    echo "  cause above is fixed. On a machine with no USRP attached that is"
+    echo "  expected: the radio profile has nothing to open."
+  else
+    echo "  Nothing has been started yet. For the over-the-air cell: scripts/up"
+  fi
+
+  # scripts/up picks CPU or CUDA itself now, so just name the script.
+  cat <<EOF
+
+  No radio on this machine? The ZMQ profile runs the whole stack - core, cell
+  and a UE - over a virtual radio, with no hardware and nothing to transmit:
+
+    ${demo}/scripts/up zmq
+
+  It chooses the CPU or CUDA image for you, preferring whichever is already
+  built, and prints which and why. Force it with --cpu or --cuda. Tear it all
+  down again with ${demo}/scripts/down - bare down covers every profile.
+  This script works against the ZMQ cell too.
+EOF
+  exit 1
+fi
+[[ "$(docker inspect -f '{{.State.Health.Status}}' $CORE 2>/dev/null)" == healthy ]] \
+  || fail "core health" "5gc is not healthy yet"
+
+G() { docker exec $GNB "$@" 2>/dev/null; }
+log() { G grep -ac "$1" /tmp/gnb.log; }
+
+# A cell takes ~10-20 s to get from container start to "Cell was activated".
+# Run straight after scripts/up and the markers are legitimately absent, which
+# is not the same as broken - reporting three hard FAILs on a healthy cell
+# teaches people to distrust this script. Wait it out, but only for as long as
+# a genuine startup takes, and say so rather than appearing to hang.
+started_at="$(docker inspect -f '{{.State.StartedAt}}' "$GNB" 2>/dev/null | cut -c1-19)"
+uptime_s=$(( $(date -u +%s) - $(date -u -d "${started_at}" +%s 2>/dev/null || date -u +%s) ))
+if [[ "$(log 'Cell was activated')" == 0 ]] && (( uptime_s < 40 )); then
+  printf '  ..    %-20s up %ss, waiting up to 40 s for it to activate\n' "still starting" "${uptime_s}"
+  while [[ "$(log 'Cell was activated')" == 0 ]] && (( uptime_s < 40 )); do
+    sleep 2
+    uptime_s=$(( $(date -u +%s) - $(date -u -d "${started_at}" +%s 2>/dev/null || date -u +%s) ))
+  done
+fi
+
+# 1. did it start, and is the cell on the air
+n=$(log "gNB started");        [[ "$n" == 1 ]] && pass "gNB started" "$n"     || fail "gNB started" "$n (expect 1)"
+n=$(log "Cell was activated"); [[ "$n" == 1 ]] && pass "cell activated" "$n"  || fail "cell activated" "$n (expect 1)"
+
+# 2. the single best health number. A missed slot deadline on a USRP is
+#    usually terminal - but a couple in the first seconds, while the lower
+#    PHY settles, are a known transient and the cell runs clean afterwards.
+#    So the number that matters is how many happened AFTER startup.
+n=$(log "Real-time failure")
+if [[ "$n" == 0 ]]; then
+  pass "real-time failures" "0"
+else
+  t0=$(G head -1 /tmp/gnb.log | cut -d. -f1)
+  after=$(G grep -a "Real-time failure" /tmp/gnb.log | cut -d. -f1 | awk -v t0="$t0" '
+    function s(x){ gsub(/[-T:]/," ",x); return mktime(x) }
+    NR==1{ base=s(t0) } { if (s($0) - base > 10) c++ } END{ print c+0 }')
+  if [[ "$after" == 0 ]]; then
+    info "real-time failures" "$n, all within 10 s of start (lower-PHY settling)"
+  else
+    fail "real-time failures" "$n total, $after AFTER startup - the cell is missing deadlines"
+  fi
+fi
+
+# 3. the radio. NOT uhd_find_devices: discovery returns "No UHD Devices Found"
+#    while the gNB holds the device, i.e. exactly when you run this. Use the
+#    gNB's own UHD output instead, which also proves it opened the radio
+#    rather than merely seeing it. UHD writes to stderr, so it is never
+#    stuck in the stdout buffer.
+clk=$(docker logs $GNB 2>&1 | grep -aoE 'Radio 1x clock: [0-9.]+ MHz' | tail -1)
+if [[ -n "$clk" ]]; then
+  pass "radio opened" "X300, ${clk#Radio 1x clock: }"
+else
+  fail "radio opened" "no [X300] init in docker logs"
+fi
+
+# 4. control plane. NGAP to the core, E3AP 36423 and E3DP 38472 for dApps.
+s=$(G ss -lna)
+miss=""
+grep -q ':36423' <<<"$s" || miss+="E3AP:36423 "
+grep -q ':38472' <<<"$s" || miss+="E3DP:38472 "
+G ss -na | grep -q '38412' || miss+="NGAP:38412 "
+[[ -z "$miss" ]] && pass "sctp endpoints" "E3AP 36423, E3DP 38472, NGAP up" \
+                 || fail "sctp endpoints" "missing: $miss"
+
+# --- informational ------------------------------------------------------
+# GPU PRACH builds its lower-PHY plan on the first occasion, which costs a
+# handful of dropped requests in the first 200 ms. Benign at t=0.0; if the
+# count keeps climbing the pool really is too small.
+n=$(log "PRACH buffer pool depleted")
+late=$(G grep -a "PRACH buffer pool depleted" /tmp/gnb.log | grep -cav '\[ *0\.0\]')
+if [[ "$n" == 0 ]]; then info "prach pool" "no depleted requests"
+elif [[ "$late" == 0 ]]; then info "prach pool" "$n depleted, all at t=0.0 (plan-on-first-use, benign)"
+else info "prach pool" "$n depleted, $late AFTER startup - look into this"; fi
+
+# The LIVE UE is whatever the latest metrics row shows. Listing every RNTI the
+# log has ever held is unreadable after a few failed attach attempts, and each
+# retry burns a new C-RNTI, so the history is noise - but its size is a useful
+# signal on its own, because a long tail means the UE kept re-attaching.
+row=$(docker logs $GNB 2>/dev/null | grep -aE '^ +[0-9]+ +[0-9a-f]{4} \|' | tail -1 | tr -s ' ')
+seen=$(G grep -ao 'rnti=0x[0-9a-f]*' /tmp/gnb.log | sort -u | grep -vc '0x7f$')
+if [[ -n "$row" ]]; then
+  cur="0x$(awk '{print $2}' <<<"${row# }")"
+  extra=""
+  (( seen > 1 )) && extra=" (${seen} C-RNTIs since start - that many attach attempts)"
+  info "UE attached" "rnti=${cur}${extra} |${row#* }"
+elif (( seen )); then
+  info "UE attached" "${seen} C-RNTI(s) in the log but no metrics row - attach attempts that failed"
+else
+  info "UE attached" "none (0x7f alone is the RA-RNTI, not a UE)"
+fi
+
+# The Class-C observer. Measured on this rig, 2026-09-19: on the radio cell it
+# publishes nothing until a UE has attached, and the client sends nothing while
+# it waits, so the gNB's 30 s transport idle timeout closes the association and
+# the container restarts, about twice a minute, forever. Once a UE attaches the
+# stream starts and then survives the UE going away again. So a looping dApp on
+# an idle cell is expected, and only a failure once a UE is up.
+det=$(docker logs $DAPP 2>/dev/null | grep -ac '"prb"')
+rst=$(docker inspect -f '{{.RestartCount}}' $DAPP 2>/dev/null); rst=${rst:-0}
+if [[ "$det" -gt 0 ]]; then
+  info "class-C dApp" "$det per-PRB detections over E3DP ($rst restarts)"
+elif [[ -n "$rnti" ]]; then
+  why=$(docker logs $DAPP 2>&1 | grep -aoE '(E3|Sctp)TransportError: .*' | tail -1)
+  fail "class-C dApp" "UE is attached but 0 detections, $rst restarts - ${why:-no error captured}"
+else
+  info "class-C dApp" "0 detections, $rst restarts - expected with no UE (30 s idle timeout)"
+fi
+
+n=$(G grep -ac "scaling governor is not set to performance" /tmp/gnb.log)
+[[ "$n" -gt 0 ]] && info "host tuning" "$n CPUs not on the performance governor"
+
+echo
+if (( bad )); then
+  printf '  \033[31m%d check(s) failed\033[0m - see above\n' "$bad"
+  exit 1
+fi
+printf '  \033[32mall good\033[0m - cell is up and healthy\n'

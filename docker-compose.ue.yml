@@ -1,0 +1,86 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# OAI nrUE on its own host, with a real radio (USRP B200mini over USB3).
+#
+# This is a SEPARATE compose project from the cell. It runs on the machine the
+# B200mini is plugged into, which need not be the machine running the gNB - the
+# two are joined only by the RF path, because the UE reaches the core through
+# the cell, not over the network.
+#
+#   docker compose -f demo/docker-compose.ue.yml build
+#   docker compose -f demo/docker-compose.ue.yml up -d
+#   docker logs -f oai_nr_ue_usrp
+#
+# One-time, on this host: the B200mini loads firmware and an FPGA image over
+# USB at every start, so they must exist for the container to bind-mount.
+#
+#   mkdir -p ~/uhd-images
+#   docker run --rm -v "$HOME/uhd-images":/usr/share/uhd/images \
+#     --entrypoint /usr/bin/uhd_images_downloader ocudu-demo/oai-nr-ue:usrp -t b2xx
+
+name: ocudu-demo-ue
+
+services:
+  ue-usrp:
+    container_name: oai_nr_ue_usrp
+    image: ocudu-demo/oai-nr-ue:usrp
+    build:
+      context: .
+      dockerfile: Dockerfile.oaiue
+      target: demo-usrp
+      additional_contexts:
+        src: ${OAIUE_REPO}#${OAIUE_BRANCH}
+        # this directory, so the builder can reach patches/oai/
+        demo: .
+      args:
+        OS_VERSION: "24.04"
+        NUM_JOBS: ${NUM_JOBS}
+    # Host networking so the UE's tunnel interface is reachable from this host
+    # for ping/iperf; the UE itself needs no route to the core.
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    ulimits:
+      rtprio: 97
+      memlock: -1
+    devices:
+      - /dev/net/tun
+    # Bind-mounting /dev/bus/usb is not enough on its own: the container also
+    # needs device-cgroup permission for USB character devices (major 189), or
+    # UHD fails with "USB open failed: insufficient permissions" and then "No
+    # USRP Device Found". A wildcard minor is required because a B200mini
+    # re-enumerates onto a new device number when its firmware loads.
+    device_cgroup_rules:
+      - 'c 189:* rmw'
+    volumes:
+      # The whole USB bus: a B200mini re-enumerates when its firmware loads, so
+      # passing a single device node by path is not enough.
+      - /dev/bus/usb:/dev/bus/usb
+      - ${UE_UHD_IMAGES_DIR:?set UE_UHD_IMAGES_DIR in .env}:/usr/share/uhd/images:ro
+      - ./configs/nrue_usrp_n78.conf:/nrue.conf:ro
+      - ./configs/uecap_ports1.xml:/uecap_ports1.xml:ro
+    command:
+      - bash
+      - -c
+      # nr-uesoftmodem dlopen()s its device library by bare name, so the build
+      # directory has to be on the library path.
+      # --continuous-tx: a B2xx can be too slow switching TX->RX for TDD n78,
+      # which shows up as a degraded link rather than an error. OAI ships a UHD
+      # patch that fixes the switching time, but it is only applied when UHD is
+      # built from source; this image takes UHD from apt, so the patch is
+      # absent and the runtime workaround is the one that applies. It keeps the
+      # TX chain sending even in receive slots. See radio/USRP/README.md
+      # upstream, "TX/RX switching times".
+      #
+      # UE_EXTRA_ARGS is the place for --tune-offset (if DC-carrier noise shows
+      # up) or --clock-source/--time-source external (if the UE is ever fed a
+      # reference too).
+      - cd /tmp/ran_build/build &&
+        LD_LIBRARY_PATH=/tmp/ran_build/build exec ./nr-uesoftmodem
+        -O /nrue.conf
+        --usrp-args "${UE_USRP_ARGS:-type=b200}"
+        --continuous-tx
+        --ue-rxgain ${UE_RX_GAIN:-95}
+        --ue-txgain ${UE_TX_GAIN:-10}
+        ${UE_EXTRA_ARGS:-}

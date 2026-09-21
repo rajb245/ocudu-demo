@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Take the over-the-air UE off the air. The counterpart to scripts/up_ue.
+set -euo pipefail
+demo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec docker compose -f "${demo}/docker-compose.ue.yml" down "$@"

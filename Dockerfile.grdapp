@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# GNU Radio Class-C observer dApps for the OCUDU E3 interface.
+#
+# Neither demo host can run these natively (the laptop is Ubuntu 20.04 with a
+# GNU Radio 3.8 python that no longer imports; the box has no GNU Radio), so
+# they get their own image: Ubuntu 24.04's GNU Radio 3.10.9 plus the ocudu_e3
+# Python client and E3 schemas taken straight from the gNB source tree, so the
+# APER codec and FlatBuffers bindings match the gNB that is publishing.
+#
+# Build context is the workspace root (../), like the gNB image.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    gnuradio python3-numpy python3-flatbuffers python3-pip ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+# asn1tools has no 24.04 package; it is pure Python.
+RUN pip3 install --no-cache-dir --break-system-packages asn1tools
+
+COPY ocudu/python/ocudu_e3 /opt/ocudu/python/ocudu_e3
+COPY ocudu/schemas/e3      /opt/ocudu/schemas/e3
+COPY ocudu-dapp-gnuradio   /opt/grdapp
+
+ENV PYTHONPATH=/opt/ocudu/python \
+    OCUDU_E3_SCHEMA_DIR=/opt/ocudu/schemas/e3 \
+    PYTHONUNBUFFERED=1
+WORKDIR /opt/grdapp
+
+# Prove the DSP chain (synthetic grids, no gNB) at build time so a broken
+# GNU Radio install fails the build rather than the demo.
+RUN python3 spectrum_threshold_dapp.py --selftest && python3 fsk_demod_dapp.py --selftest
+
+CMD ["python3", "spectrum_threshold_dapp.py", "--help"]

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Start the live E3 spectrum stream against the running cell.
+#
+# The Class-C observer subscribes over E3AP and that subscription is the only
+# thing that makes the gNB publish the uplink grid at all - production is
+# gated on a live subscription, not on a loaded dApp instance. So this really
+# does turn the stream on, it is not just starting a log tail.
+. "$(dirname "${BASH_SOURCE[0]}")/_e3_common"
+
+# Count what is already in the log: a stopped container keeps its history,
+# so only the delta tells you the stream actually restarted.
+before=$(det)
+echo "cell: $GNB ($PROFILE)   subscriptions before: $(subs)"
+"${CO[@]}" up -d "$SVC" >/dev/null 2>&1 || { echo "could not start $SVC" >&2; exit 1; }
+
+for _ in $(seq 20); do sleep 1; [[ $(( $(det) - before )) -gt 0 ]] && break; done
+n=$(( $(det) - before ))
+echo "subscriptions now: $(subs)   new detections: $n"
+if [[ "$n" -gt 0 ]]; then
+  docker logs --tail 2 $DAPP 2>/dev/null
+else
+  echo
+  echo "  nothing yet. Two reasons this happens, both expected:"
+  echo "   - ZMQ cell with no UE: a virtual radio with no peer sources no"
+  echo "     samples, so there is no grid to publish. Start the UE."
+  echo "   - expert_phy.allow_request_on_empty_uplink_slot is false: the PHY"
+  echo "     skips uplink slots with no PDUs, so the tap never fires until a"
+  echo "     UE is scheduled. All three demo cells set it true."
+  echo "  With no indications the association idles out after 30 s and the"
+  echo "  container restarts; that is a symptom, not the fault."
+fi

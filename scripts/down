@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Take everything down.
+#
+#   scripts/down          # ALL profiles - whatever is running, stop it
+#   scripts/down zmq      # only the ZMQ stack, if you really want that
+#
+# Bare down covers every profile on purpose. compose --profile selects which
+# services a command applies to, so a down for one profile leaves the others
+# running AND then fails to remove the shared network:
+#
+#   ! Network ocudu-demo_ran  Resource is still in use
+#
+# Asymmetric with scripts/up, which starts exactly one cell, and deliberately
+# so: starting is a choice, cleaning up should not require remembering which
+# choice you made.
+set -euo pipefail
+DEFAULT_PROFILES=all
+# Teardown removes containers by project and profile; the overlay only affects
+# images and build args, so pin it rather than probing the GPU to take things
+# down. Both files always parse.
+CELL_BUILD="${CELL_BUILD:-cuda}"
+. "$(dirname "${BASH_SOURCE[0]}")/_profiles"
+exec "${COMPOSE[@]}" down --remove-orphans ${REST[@]+"${REST[@]}"}

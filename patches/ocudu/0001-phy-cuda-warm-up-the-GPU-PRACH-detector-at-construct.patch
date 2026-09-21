@@ -1,0 +1,455 @@
+From 3f2fb33e47828013c0b8359e415665442f2c82c2 Mon Sep 17 00:00:00 2001
+From: Raj Bhattacharjea <rbhattacharjea@deepsig.io>
+Date: Thu, 17 Sep 2026 23:01:35 -0400
+Subject: [PATCH 1/2] phy/cuda: warm up the GPU PRACH detector at construction
+ and cache its VkFFT kernel
+
+On a real radio the accelerated build missed slot deadlines right after cell
+start and the cell stalled. Reproduced with ru_dummy and bisected to
+prach_acceleration_mode alone; an LD_PRELOAD timing trace showed the cost:
+the CUDA PRACH detector builds its VkFFT IDFT plan on the first detection,
+and initializeVkFFT() compiles the kernel with NVRTC - 15 to 54 ms per pooled
+detector instance, on main_pool workers that also carry the DU slot chain.
+Five instances warmed up on the first PRACH occasions and every queued
+DL_TTI/UL_TTI request was flushed late. Steady state is ~30 us per detection.
+
+Two layers:
+
+- prach_detector_cuda_impl runs one detection on zeroed host input at
+  construction for the cell's geometry (long/short format from the DU-low
+  translator, rx ports from the factory, zero correlation zone 0 or
+  OCUDU_PRACH_WARMUP_ZCZ), so the plan, buffers, kernels and graph exist
+  before the first live occasion. The live cell's root sequences differ, so
+  the first live detection re-uploads roots and recaptures a graph
+  (microseconds). OCUDU_PRACH_ACCELERATION_WARMUP=0 disables it.
+- prach_detector.cu keeps the compiled VkFFT image on disk
+  (OCUDU_PRACH_VKFFT_CACHE_DIR, default /tmp/ocudu-prach-vkfft; 0/off
+  disables), keyed by VkFFT version, CUDA runtime, compute capability, DFT
+  size, batch and thread aim, loaded with loadApplicationFromString. A stale
+  image costs one recompile and is replaced.
+
+The geometry derivation and backend configuration fill move into
+compute_geometry() and make_cuda_config() so the warm-up and the live path
+cannot drift apart.
+
+(cherry picked from commit 3c9280d751ff3aa270a695713b40883814830a13)
+---
+ .../o_du_low/du_low_config_translator.cpp     |   1 +
+ .../channel_processors/prach/factories.h      |   9 ++
+ include/ocudu/phy/upper/upper_phy_factories.h |   2 +
+ lib/phy/cuda/src/prach_detector.cu            |  91 ++++++++++++++-
+ .../channel_processors/prach/factories.cpp    |   6 +-
+ .../prach/prach_detector_cuda_impl.cpp        | 105 ++++++++++++++++--
+ .../prach/prach_detector_cuda_impl.h          |  21 +++-
+ lib/phy/upper/upper_phy_factories.cpp         |   4 +-
+ 8 files changed, 227 insertions(+), 12 deletions(-)
+
+diff --git a/apps/units/flexible_o_du/o_du_low/du_low_config_translator.cpp b/apps/units/flexible_o_du/o_du_low/du_low_config_translator.cpp
+index b09db9d830..a4f1e3b885 100644
+--- a/apps/units/flexible_o_du/o_du_low/du_low_config_translator.cpp
++++ b/apps/units/flexible_o_du/o_du_low/du_low_config_translator.cpp
+@@ -216,6 +216,7 @@ static odu::du_low_config generate_du_low_config(const du_low_unit_config&
+     upper_phy_cell.max_nof_td_prach_occasions = prach_cfg.nof_occasions_within_slot;
+     upper_phy_cell.max_nof_fd_prach_occasions = 1;
+     upper_phy_cell.is_prach_long_format       = is_long_preamble(prach_cfg.format);
++    upper_phy_factory_config.prach_long_format = upper_phy_cell.is_prach_long_format;
+     upper_phy_cell.nof_dl_processors          = dl_pipeline_depth;
+     upper_phy_cell.dl_bw_rb                   = bw_rb;
+     upper_phy_cell.ul_bw_rb                   = bw_rb;
+diff --git a/include/ocudu/phy/upper/channel_processors/prach/factories.h b/include/ocudu/phy/upper/channel_processors/prach/factories.h
+index b32d739c5c..65919e707e 100644
+--- a/include/ocudu/phy/upper/channel_processors/prach/factories.h
++++ b/include/ocudu/phy/upper/channel_processors/prach/factories.h
+@@ -29,6 +29,15 @@ struct prach_detector_factory_sw_configuration {
+   unsigned idft_long_size    = 1024;
+   unsigned idft_short_size   = 256;
+   float    threshold_scaling = 1.0F;
++  /// \brief Warm-up hints for an accelerated backend.
++  ///
++  /// The CUDA detector builds its IDFT plan (a runtime kernel compilation) and device buffers on first use. Left to
++  /// the slot path, that first use costs tens of milliseconds on a shared worker and shows up as a burst of late
++  /// FAPI requests. The backend warms up at construction for the geometry described here; a live geometry that
++  /// differs only pays for what still differs (root sequences and a graph capture, microseconds).
++  unsigned warmup_nof_rx_ports          = 1;
++  bool     warmup_long_format           = true;
++  unsigned warmup_zero_correlation_zone = 0;
+ };
+ 
+ std::shared_ptr<prach_detector_factory>
+diff --git a/include/ocudu/phy/upper/upper_phy_factories.h b/include/ocudu/phy/upper/upper_phy_factories.h
+index 3ea967be3a..1feaf4fdcd 100644
+--- a/include/ocudu/phy/upper/upper_phy_factories.h
++++ b/include/ocudu/phy/upper/upper_phy_factories.h
+@@ -412,6 +412,8 @@ struct upper_phy_factory_configuration {
+ 
+   /// Number of receive antenna ports.
+   unsigned nof_rx_ports;
++  /// Set to true when the cell uses a long PRACH preamble format; used to warm up an accelerated PRACH detector.
++  bool prach_long_format = true;
+   /// Number of RBs for uplink.
+   unsigned ul_bw_rb;
+   /// Maximum number of layers for PUSCH transmissions.
+diff --git a/lib/phy/cuda/src/prach_detector.cu b/lib/phy/cuda/src/prach_detector.cu
+index 83f29d7b79..fd182c9c75 100644
+--- a/lib/phy/cuda/src/prach_detector.cu
++++ b/lib/phy/cuda/src/prach_detector.cu
+@@ -14,6 +14,12 @@
+ #include <new>
+ #include <vector>
+ #include "vkFFT.h"
++#include <fstream>
++#include <iterator>
++#include <sys/types.h>
++#include <string>
++#include <sys/stat.h>
++#include <cstdio>
+ 
+ #ifndef OCUDU_PHY_CUDA_ENABLE_VKFFT
+ #error "OCUDU PHY CUDA PRACH acceleration requires the bundled VkFFT backend."
+@@ -53,6 +59,7 @@ struct prach_detector_ctx {
+     int vkfft_dft_size = 0;
+     int vkfft_batch = 0;
+     bool vkfft_valid = false;
++    std::vector<char> vkfft_cache_blob; // compiled-kernel image the current plan was loaded from, if any
+     uint64_t root_cache_key = 0;
+     int cached_nof_sequences = 0;
+     int cached_sequence_length = 0;
+@@ -561,6 +568,66 @@ bool prefer_mapped_results(const prach_detector_ctx* ctx, const prach_detector_c
+     return work <= (64u * 4u * 256u);
+ }
+ 
++// Compiled-kernel cache for the VkFFT IDFT plan.
++//
++// initializeVkFFT() compiles the kernel with NVRTC: 15-55 ms on an RTX 5090, measured on the first PRACH
++// detection of every pooled detector instance, on a shared worker that also carries the DU slot chain. The
++// constructor-time warm-up in prach_detector_cuda_impl takes it off the slot path; this cache takes it off the
++// start-up path from the second process start on. The image is keyed by everything that changes the binary:
++// VkFFT version, CUDA runtime, device compute capability, DFT size, batch and thread aim. A stale or corrupt
++// image only costs one recompile (initializeVkFFT fails, we retry without it and overwrite).
++// Directory: OCUDU_PRACH_VKFFT_CACHE_DIR (default /tmp/ocudu-prach-vkfft; "0"/"off" disables).
++std::string vkfft_cache_path(int dft_size, int batch, int aim_threads)
++{
++    const char* env = std::getenv("OCUDU_PRACH_VKFFT_CACHE_DIR");
++    std::string dir = (env != nullptr) ? env : "/tmp/ocudu-prach-vkfft";
++    if (dir.empty() || dir == "0" || dir == "off" || dir == "false") {
++        return {};
++    }
++    int device = 0;
++    cudaDeviceProp prop{};
++    if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
++        return {};
++    }
++    ::mkdir(dir.c_str(), 0755); // EEXIST is fine; any other failure surfaces as an unreadable/unwritable file below
++    char name[160];
++    std::snprintf(name, sizeof(name), "/prach_idft_vk%d_rt%d_cc%d%d_d%d_b%d_t%d.bin", VkFFTGetVersion(),
++                  CUDART_VERSION, prop.major, prop.minor, dft_size, batch, aim_threads);
++    return dir + name;
++}
++
++bool read_cache_file(const std::string& path, std::vector<char>& blob)
++{
++    std::ifstream in(path, std::ios::binary);
++    if (!in) {
++        return false;
++    }
++    blob.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++    return !blob.empty();
++}
++
++void write_cache_file(const std::string& path, const void* data, size_t size)
++{
++    if (data == nullptr || size == 0) {
++        return;
++    }
++    const std::string tmp = path + ".tmp";
++    {
++        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
++        if (!out) {
++            return;
++        }
++        out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
++        if (!out) {
++            std::remove(tmp.c_str());
++            return;
++        }
++    }
++    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
++        std::remove(tmp.c_str());
++    }
++}
++
+ bool ensure_plan(prach_detector_ctx* ctx, int dft_size, int batch, cudaStream_t stream)
+ {
+     if (ctx->vkfft_valid && ctx->vkfft_dft_size == dft_size && ctx->vkfft_batch == batch &&
+@@ -599,10 +666,32 @@ bool ensure_plan(prach_detector_ctx* ctx, int dft_size, int batch, cudaStream_t
+     // Larger DFTs (format-0, 1024) benefit from more threads on GB10-class GPUs.
+     configuration.aimThreads = (dft_size >= 512) ? 256 : 128;
+ 
+-    if (initializeVkFFT(&ctx->vkfft_app, configuration) != VKFFT_SUCCESS) {
++    const std::string cache_path = vkfft_cache_path(dft_size, batch, static_cast<int>(configuration.aimThreads));
++    std::vector<char>  cache_blob;
++    if (!cache_path.empty() && read_cache_file(cache_path, cache_blob)) {
++        configuration.loadApplicationFromString = 1;
++        configuration.loadApplicationString     = cache_blob.data();
++    } else if (!cache_path.empty()) {
++        configuration.saveApplicationToString = 1;
++    }
++    VkFFTResult init_result = initializeVkFFT(&ctx->vkfft_app, configuration);
++    if ((init_result != VKFFT_SUCCESS) && (configuration.loadApplicationFromString != 0)) {
++        // Stale or corrupt cache image: compile as if it were not there, and replace it.
++        std::memset(&ctx->vkfft_app, 0, sizeof(ctx->vkfft_app));
++        cache_blob.clear();
++        configuration.loadApplicationFromString = 0;
++        configuration.loadApplicationString     = nullptr;
++        configuration.saveApplicationToString   = 1;
++        init_result                             = initializeVkFFT(&ctx->vkfft_app, configuration);
++    }
++    if (init_result != VKFFT_SUCCESS) {
+         std::memset(&ctx->vkfft_app, 0, sizeof(ctx->vkfft_app));
+         return false;
+     }
++    if ((configuration.saveApplicationToString != 0) && !cache_path.empty()) {
++        write_cache_file(cache_path, ctx->vkfft_app.saveApplicationString, ctx->vkfft_app.applicationStringSize);
++    }
++    ctx->vkfft_cache_blob = std::move(cache_blob);
+     ctx->vkfft_dft_size = dft_size;
+     ctx->vkfft_batch = batch;
+     ctx->vkfft_valid = true;
+diff --git a/lib/phy/upper/channel_processors/prach/factories.cpp b/lib/phy/upper/channel_processors/prach/factories.cpp
+index 0a5300dcf7..293394207b 100644
+--- a/lib/phy/upper/channel_processors/prach/factories.cpp
++++ b/lib/phy/upper/channel_processors/prach/factories.cpp
+@@ -135,8 +135,12 @@ public:
+                                                                   dft_factory->create(idft_short_config),
+                                                                   prach_gen_factory->create(),
+                                                                   config.threshold_scaling);
++    prach_detector_cuda_impl::warmup_configuration warmup;
++    warmup.nof_rx_ports          = config.warmup_nof_rx_ports;
++    warmup.long_format           = config.warmup_long_format;
++    warmup.zero_correlation_zone = config.warmup_zero_correlation_zone;
+     return std::make_unique<prach_detector_cuda_impl>(
+-        prach_gen_factory->create(), std::move(fallback), force_gpu_path, nvcuda_device_id);
++        prach_gen_factory->create(), std::move(fallback), force_gpu_path, nvcuda_device_id, warmup);
+   }
+ 
+   std::unique_ptr<prach_detector_validator> create_validator() override
+diff --git a/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.cpp b/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.cpp
+index c30cb44f55..7ec41b1b50 100644
+--- a/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.cpp
++++ b/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.cpp
+@@ -12,7 +12,9 @@
+ #include "ocudu/ran/prach/prach_preamble_information.h"
+ #include "ocudu/support/error_handling.h"
+ #include "ocudu/support/math/math_utils.h"
++#include "ocudu/ocudulog/ocudulog.h"
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+@@ -77,7 +79,8 @@ struct prach_detector_cuda_impl::detector_geometry {
+ prach_detector_cuda_impl::prach_detector_cuda_impl(std::unique_ptr<prach_generator> generator_,
+                                                    std::unique_ptr<prach_detector>  fallback_,
+                                                    bool                             force_gpu_path_,
+-                                                   int                              cuda_device_id_) :
++                                                   int                              cuda_device_id_,
++                                                   warmup_configuration             warmup) :
+   generator(std::move(generator_)),
+   fallback(std::move(fallback_)),
+   force_gpu_path(force_gpu_path_),
+@@ -118,6 +121,78 @@ prach_detector_cuda_impl::prach_detector_cuda_impl(std::unique_ptr<prach_generat
+   }
+ 
+   gpu_available = true;
++
++  warm_up(warmup);
++}
++
++void prach_detector_cuda_impl::warm_up(const warmup_configuration& warmup)
++{
++  if (!gpu_available || (handle == nullptr) || (stream == nullptr)) {
++    return;
++  }
++  if (!env_flag_enabled("OCUDU_PRACH_ACCELERATION_WARMUP", true)) {
++    return;
++  }
++  ocudulog::basic_logger& logger = ocudulog::fetch_basic_logger("PHY");
++
++  // A representative configuration for the cell: format 0 (long) or B4 (short), all 64 preambles, unrestricted
++  // set, root 0. Root sequences differ from the live cell's, so the first live detection re-uploads roots and
++  // captures a new graph (microseconds); the IDFT plan, buffers and kernels are keyed by geometry and are reused.
++  configuration config        = {};
++  config.root_sequence_index  = 0;
++  config.format               = warmup.long_format ? prach_format_type::zero : prach_format_type::B4;
++  config.restricted_set       = restricted_set_config::UNRESTRICTED;
++  config.zero_correlation_zone = env_unsigned("OCUDU_PRACH_WARMUP_ZCZ", warmup.zero_correlation_zone);
++  config.start_preamble_index = 0;
++  config.nof_preamble_indices = prach_constants::MAX_NUM_PREAMBLES;
++  config.ra_scs               = warmup.long_format ? prach_subcarrier_spacing::kHz1_25 : prach_subcarrier_spacing::kHz30;
++  config.nof_rx_ports         = std::max(1U, warmup.nof_rx_ports);
++  config.slot                 = slot_point();
++
++  if (prach_cyclic_shifts_get(config.ra_scs, config.restricted_set, config.zero_correlation_zone) ==
++      PRACH_CYCLIC_SHIFTS_RESERVED) {
++    logger.warning("CUDA: PRACH detector warm-up skipped, zero correlation zone {} is reserved for this format.",
++                   config.zero_correlation_zone);
++    return;
++  }
++
++  const auto              t0       = std::chrono::steady_clock::now();
++  const detector_geometry geometry = compute_geometry(config);
++
++  std::lock_guard<std::mutex> lock(detector_mutex);
++  prepare_roots(config, geometry);
++
++  // Zeroed host input of the live shape: ports x symbols x sequence length, one cbf16 per word.
++  host_prach_packed.assign(static_cast<size_t>(config.nof_rx_ports) * geometry.nof_symbols * geometry.sequence_length,
++                           0U);
++  prach_detector_config_t cuda_config = make_cuda_config(config, geometry);
++  cuda_config.input_is_device         = 0;
++  cuda_config.input_symbol_stride     = static_cast<int>(geometry.sequence_length);
++  cuda_config.input_port_stride       = static_cast<int>(geometry.nof_symbols * geometry.sequence_length);
++
++  const cf_t* active_roots =
++      host_roots.data() + static_cast<size_t>(geometry.active_sequence_start) * geometry.sequence_length;
++  prach_detector_result_t cuda_result = {};
++  nr_ldpc_status_t        status =
++      prach_detector_detect(handle, host_prach_packed.data(), active_roots, &cuda_config, &cuda_result, stream);
++
++  const double elapsed_ms =
++      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++  if (!is_success(status)) {
++    logger.warning("CUDA: PRACH detector warm-up failed (status {}) after {:.1f} ms; the first live detection will "
++                   "build the plan instead.",
++                   static_cast<int>(status),
++                   elapsed_ms);
++    return;
++  }
++  logger.info("CUDA: PRACH detector warmed up for {} preamble format, {} rx port(s), zcz {} in {:.1f} ms "
++              "(IDFT {} x {} batches).",
++              warmup.long_format ? "long" : "short",
++              config.nof_rx_ports,
++              config.zero_correlation_zone,
++              elapsed_ms,
++              geometry.dft_size,
++              config.nof_rx_ports * (geometry.combine_symbols ? 1U : geometry.nof_symbols) * geometry.active_nof_sequences);
+ }
+ 
+ prach_detector_cuda_impl::~prach_detector_cuda_impl()
+@@ -146,8 +221,8 @@ bool ocudu::is_prach_detector_cuda_available()
+   return true;
+ }
+ 
+-prach_detection_result prach_detector_cuda_impl::detect(const prach_buffer&                  input,
+-                                                        const prach_detector::configuration& config)
++prach_detector_cuda_impl::detector_geometry
++prach_detector_cuda_impl::compute_geometry(const prach_detector::configuration& config) const
+ {
+   detector_geometry geometry;
+   geometry.preamble_info = is_long_preamble(config.format)
+@@ -204,6 +279,13 @@ prach_detection_result prach_detector_cuda_impl::detect(const prach_buffer&
+       (geometry.n_cs == 0) ? geometry.cp_prach : std::min(std::max(geometry.n_cs, 1U) - 1U, geometry.cp_prach);
+   geometry.max_delay_samples = (geometry.max_delay_samples * geometry.dft_size) / geometry.sequence_length;
+   geometry.nof_symbols       = geometry.preamble_info.nof_symbols;
++  return geometry;
++}
++
++prach_detection_result prach_detector_cuda_impl::detect(const prach_buffer&                  input,
++                                                        const prach_detector::configuration& config)
++{
++  const detector_geometry geometry = compute_geometry(config);
+ 
+   if (!should_use_gpu(input, config, geometry)) {
+     return fallback->detect(input, config);
+@@ -239,12 +321,9 @@ bool prach_detector_cuda_impl::should_use_gpu(const prach_buffer&      input,
+   return long_sequence_work >= min_long_sequence_work;
+ }
+ 
+-prach_detection_result prach_detector_cuda_impl::detect_gpu(const prach_buffer&      input,
+-                                                            const configuration&     config,
+-                                                            const detector_geometry& geometry)
++prach_detector_config_t prach_detector_cuda_impl::make_cuda_config(const configuration&     config,
++                                                                    const detector_geometry& geometry) const
+ {
+-  prepare_roots(config, geometry);
+-
+   prach_detector_config_t cuda_config = {};
+   cuda_config.sequence_length         = static_cast<int>(geometry.sequence_length);
+   cuda_config.dft_size                = static_cast<int>(geometry.dft_size);
+@@ -265,6 +344,16 @@ prach_detection_result prach_detector_cuda_impl::detect_gpu(const prach_buffer&
+       cached_root_key ^ (0x9e3779b97f4a7c15ULL + (static_cast<uint64_t>(geometry.active_sequence_start) << 6) +
+                          (static_cast<uint64_t>(geometry.active_sequence_start) >> 2));
+   cuda_config.root_cache_key = active_root_key;
++  return cuda_config;
++}
++
++prach_detection_result prach_detector_cuda_impl::detect_gpu(const prach_buffer&      input,
++                                                            const configuration&     config,
++                                                            const detector_geometry& geometry)
++{
++  prepare_roots(config, geometry);
++
++  prach_detector_config_t cuda_config = make_cuda_config(config, geometry);
+ 
+   const void* prach_input = nullptr;
+   if (input.supports_device_prach_buffer_reading() && input.prepare_device_prach_buffer_reading(stream)) {
+diff --git a/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.h b/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.h
+index c881ce137a..521f10f8bf 100644
+--- a/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.h
++++ b/lib/phy/upper/channel_processors/prach/prach_detector_cuda_impl.h
+@@ -18,10 +18,18 @@ namespace ocudu {
+ class prach_detector_cuda_impl : public prach_detector
+ {
+ public:
++  /// Geometry the detector warms up for at construction. See prach_detector_factory_sw_configuration.
++  struct warmup_configuration {
++    unsigned nof_rx_ports          = 1;
++    bool     long_format           = true;
++    unsigned zero_correlation_zone = 0;
++  };
++
+   prach_detector_cuda_impl(std::unique_ptr<prach_generator> generator_,
+                            std::unique_ptr<prach_detector>  fallback_,
+                            bool                             force_gpu_path_,
+-                           int                              cuda_device_id_ = 0);
++                           int                              cuda_device_id_,
++                           warmup_configuration             warmup);
+ 
+   ~prach_detector_cuda_impl() override;
+ 
+@@ -35,6 +43,17 @@ public:
+ private:
+   struct detector_geometry;
+ 
++  /// Derives the detector geometry from a configuration (shared by the live path and the warm-up).
++  detector_geometry compute_geometry(const configuration& config) const;
++
++  /// Fills the backend configuration for a geometry. Input placement and strides are left to the caller.
++  prach_detector_config_t make_cuda_config(const configuration& config, const detector_geometry& geometry) const;
++
++  /// Runs one detection on zeroed host input at construction so the backend's IDFT plan (a runtime kernel
++  /// compilation), device buffers, kernels and graph exist before the first live occasion. A failure is logged and
++  /// leaves the detector usable; it then pays the cost on first use as before.
++  void warm_up(const warmup_configuration& warmup);
++
+   bool should_use_gpu(const prach_buffer& input, const configuration& config, const detector_geometry& geometry) const;
+ 
+   prach_detection_result
+diff --git a/lib/phy/upper/upper_phy_factories.cpp b/lib/phy/upper/upper_phy_factories.cpp
+index 6b88b4bc16..d0f6728efe 100644
+--- a/lib/phy/upper/upper_phy_factories.cpp
++++ b/lib/phy/upper/upper_phy_factories.cpp
+@@ -735,7 +735,9 @@ create_ul_processor_factory(const upper_phy_factory_configuration& config,
+   // PRACH detector factory configuration: we keep the DFT sizes at the default values and we only set the threshold
+   // scaling factor to the configured value.
+   prach_detector_factory_sw_configuration prach_detector_factory_cfg;
+-  prach_detector_factory_cfg.threshold_scaling = config.prach_th_correction_factor;
++  prach_detector_factory_cfg.threshold_scaling   = config.prach_th_correction_factor;
++  prach_detector_factory_cfg.warmup_nof_rx_ports = std::max(1U, config.nof_rx_ports);
++  prach_detector_factory_cfg.warmup_long_format  = config.prach_long_format;
+   std::shared_ptr<prach_detector_factory> prach_factory =
+       create_prach_detector_factory_accelerated(dft_factory,
+                                                 prach_gen_factory,
+-- 
+2.43.0
+

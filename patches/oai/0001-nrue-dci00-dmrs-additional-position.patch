@@ -1,0 +1,44 @@
+Subject: nrUE: assume dmrs-AdditionalPosition pos2 on DCI format 0_0 grants
+
+TS 38.214 Section 6.2.2 has the UE assume dmrs-AdditionalPosition = pos2 for a
+PUSCH scheduled by DCI format 0_0, whatever dmrs-UplinkForPUSCH-MappingTypeA
+says. The nrUE instead applied the dedicated value as soon as a pusch-Config
+existed, for every DCI format.
+
+That is invisible while the dedicated value is pos2 -- the default -- and a hard
+attach failure otherwise. The gNB's fallback scheduler builds msg5's UL grant
+with the common DMRS information (pos2, three DMRS symbols on a 14-symbol type-A
+allocation); the UE, having just applied the master cell group from RRCSetup,
+transmits the dedicated pattern (pos1 -> two DMRS symbols). msg5 never decodes,
+RLC hits max retransmissions, RRC releases, and the UE loops through random
+access forever: "Received indication that RLC reached max retransmissions"
+followed by repeated "RAR reception failed".
+
+Confirmed on this bench 2026-09-18: with cell_cfg.pusch.dmrs_additional_position
+set to 1 the OAI nrUE never attached in 170 s and ended in "max retransmissions";
+at the default pos2 the same UE attached in 10 s.
+
+Only affects a cell configured with cell_cfg.pusch.dmrs_additional_position
+set to 1; a cell at the pos2 default behaves identically either way.
+
+Origin: DeepSig, 2026-08-23, carried here verbatim. Applies to
+github.com/duranta-project/openairinterface5g @ develop, which does not have the
+guard. Upstream OAI status not verified. OAI is under the Collaborative
+Standards Software License v1.0 (LicenseRef-CSSL-1.0, text in LICENSES/);
+nr_ue_scheduler.c carries that identifier itself. OAI-PL-v1.1 is deprecated
+upstream. This file is a modification to OAI, not to any OCUDU component.
+
+--- a/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
++++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
+@@ -923,7 +923,10 @@
+     /* HARQ_PROCESS_NUMBER */
+     pusch_config_pdu->pusch_data.harq_process_id = pid;
+ 
+-    if (NR_DMRS_ulconfig != NULL)
++    // TS 38.214 6.2.2: a PUSCH scheduled by DCI format 0_0 uses the default
++    // dmrs-AdditionalPosition (pos2, set above), not the dedicated value, which
++    // is what the gNB's fallback scheduler assumes for msg5.
++    if (NR_DMRS_ulconfig != NULL && dci_format != NR_UL_DCI_FORMAT_0_0)
+       add_pos = (NR_DMRS_ulconfig->dmrs_AdditionalPosition == NULL) ? 2 : *NR_DMRS_ulconfig->dmrs_AdditionalPosition;
+ 
+     /* DMRS */

@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+#
+# OAI nrUE for the demo, plus the network tools needed to actually show
+# traffic going through the cell.
+#
+# This is now the only home of the recipe. The `deps` and `builder` stages
+# began as a copy of a DeepSig-internal OAI recipe and this is now their only
+# home, so there is nothing to keep in sync. The OAI source itself is still fetched by BuildKit from the Duranta
+# fork as the `src` remote context.
+#
+
+ARG OS_VERSION=24.04
+ARG TARGET=builder
+
+# ---------- Stage 1: deps ----------
+FROM ubuntu:$OS_VERSION AS deps
+
+# Copy openairinterface5g source from additional_contexts: src
+# (needed early so build_oai -I can install OAI's own dependencies)
+COPY --from=src . /opt/openairinterface5g
+
+# Install build dependencies
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
+        # ZMQ dependency
+        libzmq3-dev \
+    # Install OAI dependencies via build_oai -I
+    && cd /opt/openairinterface5g/cmake_targets \
+    && ./build_oai -I \
+    && apt-get autoremove && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ---------- Stage 2: builder ----------
+FROM deps AS builder
+
+ARG NUM_JOBS=""
+
+# Build OAI UE only with ZMQ support.
+# build_oai parallelism is set via --build-tool-opt (defaults to -j$(nproc)).
+RUN if [ -z "$NUM_JOBS" ]; then NUM_JOBS=$(nproc); fi && \
+    cd /opt/openairinterface5g/cmake_targets && \
+    ./build_oai --ninja --nrUE -w ZMQ -C --build-tool-opt "-j${NUM_JOBS}"
+
+# Save build artifacts as warm cache for dev mode, then delete source to save space
+RUN cp -r /opt/openairinterface5g/cmake_targets/ran_build /tmp/ran_build && rm -rf /opt/openairinterface5g
+
+# ---------- Stage: PHY link-level simulators (diagnostics, not the demo) ----------
+# OAI's own link-level simulators: nr_dlsim runs the real gNB transmit chain
+# and the real nrUE receive chain against a configurable channel, with no
+# radio, no scheduler and no TCP, and reports BLER directly. nr_dlschsim is
+# the coding chain without OFDM or channel estimation, and ldpctest is the
+# decoder alone - so the three together bisect a receive-side failure by
+# layer instead of inferring it from throughput.
+#
+# Built from the same deps stage, so it costs a compile and no new downloads.
+# Not part of any demo image: build it explicitly when you need it.
+#
+#   docker build --target sims -t ocudu-demo/oai-sims \
+#     --build-context src=https://github.com/duranta-project/openairinterface5g.git#<commit> .
+FROM deps AS sims
+ARG NUM_JOBS=""
+RUN if [ -z "$NUM_JOBS" ]; then NUM_JOBS=$(nproc); fi && \
+    cd /opt/openairinterface5g/cmake_targets && \
+    ./build_oai --ninja --phy_simulators -C --build-tool-opt "-j${NUM_JOBS}" && \
+    ls ran_build/build/nr_dlsim ran_build/build/nr_dlschsim ran_build/build/ldpctest
+
+# ---------- Stage 3a: USRP builder ----------
+# A second build of the same source selecting the USRP device library, for a
+# UE with a real radio (B200mini over USB3). build_oai's -w picks exactly one
+# device library, so this cannot be folded into the ZMQ build above; it forks
+# from the shared deps stage instead, so only the compile repeats.
+FROM deps AS builder-usrp
+
+ARG NUM_JOBS=""
+
+# TS 38.214 6.2.2: a PUSCH scheduled by DCI format 0_0 uses the DEFAULT
+# dmrs-AdditionalPosition, not the dedicated one. The nrUE applies the dedicated
+# value for every DCI format, which is invisible at the pos2 default and a hard
+# attach failure when the cell sets pos1: msg5 never decodes, RLC hits max
+# retransmissions and the UE loops through random access (measured on this
+# bench, 2026-09-18). Only a cell that sets dmrs_additional_position: 1 needs
+# it, so carry the fix to make such a cell demonstrable.
+#
+# Patched in the USRP builder only: the ZMQ UE has no reason to diverge from
+# upstream, and the two builders already share the `deps` stage cache.
+COPY --from=demo patches/oai/0001-nrue-dci00-dmrs-additional-position.patch /tmp/
+RUN cd /opt/openairinterface5g \
+    && patch -p1 --forward --batch < /tmp/0001-nrue-dci00-dmrs-additional-position.patch \
+    && grep -q "dci_format != NR_UL_DCI_FORMAT_0_0" openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c \
+    && echo "nrUE DCI-0_0 DMRS patch applied"
+
+# UHD's public headers include Boost, and libuhd-dev does not pull the Boost
+# headers under --no-install-recommends, so the USRP device library fails with
+# "uhd/config.hpp: fatal error: boost/config.hpp: No such file or directory".
+# Ninja keeps scheduling other work for ~40s after that, so the real error ends
+# up buried well above the failing step in the log.
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libuhd-dev uhd-host \
+        libboost-dev \
+        libboost-program-options-dev \
+        libboost-filesystem-dev \
+        libboost-system-dev \
+        libboost-thread-dev \
+        libboost-date-time-dev \
+        libboost-chrono-dev \
+        libboost-atomic-dev \
+        libboost-serialization-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN if [ -z "$NUM_JOBS" ]; then NUM_JOBS=$(nproc); fi && \
+    cd /opt/openairinterface5g/cmake_targets && \
+    ./build_oai --ninja --nrUE -w USRP -C --build-tool-opt "-j${NUM_JOBS}"
+
+RUN cp -r /opt/openairinterface5g/cmake_targets/ran_build /tmp/ran_build && rm -rf /opt/openairinterface5g
+
+# ---------- Stage 3b: demo-usrp ----------
+# The UE that runs against an over-the-air cell. A B200mini loads its firmware
+# and FPGA image over USB at every start (unlike the X310, which holds its
+# image in flash), so /usr/share/uhd/images must be populated - bind-mount a
+# host directory filled by uhd_images_downloader -t b2xx.
+FROM builder-usrp AS demo-usrp
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 \
+        iputils-ping \
+        iperf3 \
+        tcpdump \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ---------- Stage 3: demo ----------
+# Everything above is upstream; this layer is the demo's only addition.
+FROM builder AS demo
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 \
+        iputils-ping \
+        iperf3 \
+        tcpdump \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*

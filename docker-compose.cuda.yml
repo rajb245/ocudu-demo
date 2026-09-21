@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# CUDA overlay: rebuild the gNB image on a CUDA devel base with ENABLE_CUDA=ON
+# and hand the container the host GPUs.
+#
+#   docker compose -f demo/docker-compose.yml -f demo/docker-compose.cuda.yml up -d
+#
+# Set OCUDU_CUDA_ARCHITECTURES in demo/.env for the deployment GPU
+# (120-real = RTX 5090 Blackwell, 89-real = RTX 4090 / RTX 6000 Ada,
+#  90-real = H100/GH200, 121 = GB10 - note 121 is NOT the 5090).
+#
+# A CUDA 13 base image needs an r580+ driver on the host; a 5090 box will
+# have one, this laptop (575.57.08, Turing) will not.
+
+services:
+  gnb:
+    image: ${GNB_CUDA_IMAGE}
+    build:
+      args:
+        BASE_IMAGE: ${OCUDU_CUDA_IMAGE}
+        OCUDU_ENABLE_CUDA: "ON"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Same gates, with the GPU attached so libcuda.so.1 resolves.
+  gates:
+    image: ${GNB_CUDA_IMAGE}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # CUDA-accelerated L1 driving the USRP.
+  gnb-usrp:
+    image: ${GNB_CUDA_IMAGE}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

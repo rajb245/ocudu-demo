@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+# Start the iperf3 servers the UE measures against. Run on the gNB host.
+#
+#   scripts/iperf_server         # start (idempotent)
+#   scripts/iperf_server stop
+#
+# They live in the core container because 10.45.1.1 is the UPF's address on
+# the UE's data network - that is the far end of the tunnel.
+#
+# Two ports because iperf3 -R reuses the control connection, so uplink and
+# downlink need a server each. Persistent, NOT -1: one-shot servers have to be
+# restarted between every measurement, and anything that opens the port at all
+# consumes them - including a reachability probe, which cost us a run.
+set -uo pipefail
+CORE=ocudu_demo_5gc
+PORTS=(7201 7202)
+
+docker inspect -f '{{.State.Running}}' "$CORE" 2>/dev/null | grep -q true \
+  || { echo "${CORE} is not running - scripts/up" >&2; exit 1; }
+
+listening() { docker exec "$CORE" ss -lnt 2>/dev/null | grep -q ":$1 "; }
+
+if [[ "${1:-start}" == stop ]]; then
+  docker exec "$CORE" pkill -f 'iperf3 -s' 2>/dev/null
+  echo "stopped"
+  exit 0
+fi
+
+for p in "${PORTS[@]}"; do
+  if listening "$p"; then
+    echo "  port ${p}: already listening"
+  else
+    docker exec -d "$CORE" iperf3 -s -p "$p" >/dev/null 2>&1
+  fi
+done
+sleep 1
+bad=0
+for p in "${PORTS[@]}"; do
+  listening "$p" && echo "  port ${p}: ready" || { echo "  port ${p}: FAILED to start" >&2; bad=1; }
+done
+(( bad )) && exit 1
+echo "Now on the UE host:  scripts/iperf_ue [seconds]"
