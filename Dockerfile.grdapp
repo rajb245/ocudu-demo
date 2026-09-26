@@ -2,11 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 # GNU Radio Class-C observer dApps for the OCUDU E3 interface.
 #
-# Neither demo host can run these natively (the laptop is Ubuntu 20.04 with a
-# GNU Radio 3.8 python that no longer imports; the box has no GNU Radio), so
-# they get their own image: Ubuntu 24.04's GNU Radio 3.10.9 plus the ocudu_e3
-# Python client and E3 schemas taken straight from the gNB source tree, so the
-# APER codec and FlatBuffers bindings match the gNB that is publishing.
+# Ubuntu 24.04's GNU Radio 3.10 plus the ocudu_e3 Python client and E3 schemas
+# from the gNB source tree, so the codecs match the gNB.
 #
 # Build context is the workspace root (../), like the gNB image.
 FROM ubuntu:24.04

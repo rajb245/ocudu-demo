@@ -136,16 +136,22 @@ else
   fi
 fi
 
-# 3. the radio. NOT uhd_find_devices: discovery returns "No UHD Devices Found"
-#    while the gNB holds the device, i.e. exactly when you run this. Use the
-#    gNB's own UHD output instead, which also proves it opened the radio
-#    rather than merely seeing it. UHD writes to stderr, so it is never
-#    stuck in the stdout buffer.
-clk=$(docker logs $GNB 2>&1 | grep -aoE 'Radio 1x clock: [0-9.]+ MHz' | tail -1)
-if [[ -n "$clk" ]]; then
-  pass "radio opened" "X300, ${clk#Radio 1x clock: }"
+# 3. the radio. Only meaningful on the USRP cell: the ZMQ cell has a virtual
+#    radio and never emits UHD output, so requiring it there fails a perfectly
+#    healthy ZMQ cell (and, being a hard fail, makes check exit 1). Skip it on
+#    zmq. NOT uhd_find_devices: discovery returns "No UHD Devices Found" while
+#    the gNB holds the device, i.e. exactly when you run this. Use the gNB's own
+#    UHD output instead, which also proves it opened the radio rather than merely
+#    seeing it. UHD writes to stderr, so it is never stuck in the stdout buffer.
+if [[ "$CELL" == radio ]]; then
+  clk=$(docker logs $GNB 2>&1 | grep -aoE 'Radio 1x clock: [0-9.]+ MHz' | tail -1)
+  if [[ -n "$clk" ]]; then
+    pass "radio opened" "X300, ${clk#Radio 1x clock: }"
+  else
+    fail "radio opened" "no [X300] init in docker logs"
+  fi
 else
-  fail "radio opened" "no [X300] init in docker logs"
+  info "radio opened" "n/a - ZMQ virtual radio, no UHD device"
 fi
 
 # 4. control plane. NGAP to the core, E3AP 36423 and E3DP 38472 for dApps.
@@ -176,20 +182,22 @@ seen=$(G grep -ao 'rnti=0x[0-9a-f]*' /tmp/gnb.log | sort -u | grep -vc '0x7f$')
 if [[ -n "$row" ]]; then
   cur="0x$(awk '{print $2}' <<<"${row# }")"
   extra=""
-  (( seen > 1 )) && extra=" (${seen} C-RNTIs since start - that many attach attempts)"
+  (( seen > 1 )) && extra=" (${seen} C-RNTIs seen since start; a long tail means repeated re-attach)"
   info "UE attached" "rnti=${cur}${extra} |${row#* }"
 elif (( seen )); then
-  info "UE attached" "${seen} C-RNTI(s) in the log but no metrics row - attach attempts that failed"
+  # No metrics row yet does NOT mean the attach failed: the gNB's stdout is
+  # block-buffered (no TTY on a compose service), so the table appears in ~30 s
+  # bursts. A UE that attached seconds ago has no row yet. Re-run check after a
+  # burst; only a count that keeps growing with no row is a real attach failure.
+  info "UE attached" "${seen} C-RNTI(s) seen but no metrics row yet - the table is block-buffered (~30 s); re-run check"
 else
   info "UE attached" "none (0x7f alone is the RA-RNTI, not a UE)"
 fi
 
-# The Class-C observer. Measured on this rig, 2026-09-19: on the radio cell it
-# publishes nothing until a UE has attached, and the client sends nothing while
-# it waits, so the gNB's 30 s transport idle timeout closes the association and
-# the container restarts, about twice a minute, forever. Once a UE attaches the
-# stream starts and then survives the UE going away again. So a looping dApp on
-# an idle cell is expected, and only a failure once a UE is up.
+# The Class-C observer. With no uplink samples (the ZMQ cell with no UE) the
+# stream is idle, the gNB's 30 s idle timeout closes the association and the
+# container restarts. That is expected; zero detections is only a problem
+# once a UE is up.
 det=$(docker logs $DAPP 2>/dev/null | grep -ac '"prb"')
 rst=$(docker inspect -f '{{.RestartCount}}' $DAPP 2>/dev/null); rst=${rst:-0}
 if [[ "$det" -gt 0 ]]; then

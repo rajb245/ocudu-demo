@@ -2,22 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
 # SPDX-License-Identifier: BSD-3-Clause-Open-MPI
 #
-# OCUDU dApp/E3 demo: Open5GS 5GC + OCUDU gNB (dApp runtime, E3 plane) + OAI
-# nrUE over a ZeroMQ virtual radio. One cell, one UE, no radio hardware.
-#
-#   docker compose -f demo/docker-compose.yml up -d            # core + cell + UE
-#   docker compose -f demo/docker-compose.yml --profile ui up -d   # + Grafana
-#   docker compose -f demo/docker-compose.yml -f demo/docker-compose.cuda.yml up -d
-#
-# Run it from the workspace root (the directory holding ocudu/,
-# ocudu-dapp-sdk/ and demo/).
+# OCUDU dApp/E3 demo: Open5GS 5GC + OCUDU gNB + OAI nrUE + GNU Radio observer.
+# Use scripts/up and scripts/down, which pick the profile and the CPU or CUDA
+# image. Profiles: zmq (virtual radio), radio (USRP), ui (Grafana), gates.
 
 name: ocudu-demo
 
 services:
   # --------------------------------------------------------------------
-  # Open5GS 5G core, built unchanged from the public platform's own docker/
-  # tree (the same files srsRAN shipped; the project moved to OCUDU in 2025).
+  # Open5GS 5G core, built from the platform's docker/ tree.
   5gc:
     container_name: ocudu_demo_5gc
     image: ocudu-demo/5gc
@@ -30,11 +23,8 @@ services:
     env_file:
       - ../ocudu/docker/open5gs/open5gs.env
     environment:
-      # One subscriber, matching configs/nrue_zmq.conf and nrue_usrp_n78.conf.
-      # add_users.py takes either a path ending in .csv or this inline form:
-      #   imsi,key,op_type,op/opc,amf,qci,ip_alloc
-      # It registers the APN from its own default, which upstream is
-      # "internet" - that is why both UE configs ask for that DNN.
+      # One subscriber, matching configs/nrue_zmq.conf and nrue_usrp_n78.conf:
+      #   imsi,key,op_type,op/opc,amf,qci,ip_alloc   (DNN "internet")
       SUBSCRIBER_DB: "001010123456789,00112233445566778899aabbccddeeff,opc,63bfa50ee6523365ff14c1f45f88737d,9001,9,10.45.1.2"
     privileged: true
     ports:
@@ -54,10 +44,7 @@ services:
   gnb:
     container_name: ocudu_demo_gnb
     image: ${GNB_IMAGE}
-    # The ZMQ cell and the USRP cell are alternatives, never both: two gNBs
-    # against one core, and only one can own the cell. COMPOSE_PROFILES=zmq in
-    # .env makes this the default, and a CLI --profile REPLACES that value
-    # rather than adding to it, so "--profile radio up" excludes these two.
+    # The zmq and radio cells are alternatives; run only one.
     profiles: [zmq]
     build:
       context: ..
@@ -188,28 +175,18 @@ services:
     depends_on:
       5gc:
         condition: service_healthy
-    # A gNB that dies leaves /run/ocudu/dapp-management.sock behind in the
-    # container filesystem, and the next start of the same container fails
-    # with "local management socket path already exists". Clear it first.
+    # Clear a stale dApp socket left by a previous run, or the gNB will not start.
     command:
       - bash
       - -c
       - rm -f /run/ocudu/dapp-management.sock; exec gnb -c /etc/ocudu/gnb.yml
 
   # --------------------------------------------------------------------
-  # GNU Radio Class-C observer dApp (github.com/rajb245/ocudu-dapp-gnuradio).
-  # Subscribes to the gNB's live uplink resource grid over E3AP (sctp/36423,
-  # stream classc.spectrum) and runs it through GNU Radio blocks. It is a plain
-  # SCTP client: no manifest, no signing, nothing loaded into the gNB. The
-  # portable E3 spectrum route exists whenever e3ap_sctp is configured, and it
-  # goes live the moment a subscriber attaches - the reference spectrum dApp in
-  # the catalog does not need to be activated for this to flow.
-  #
-  # An idle cell prints nothing but a clean floor; detections appear in the
-  # PRBs the scheduler grants once a UE is pushing uplink traffic (iperf3 -R
-  # from the UE, or just the attach itself). GRDAPP_SCRIPT selects the example
-  # (spectrum_threshold_dapp.py | fsk_demod_dapp.py), GRDAPP_ARGS passes its
-  # options through, e.g. GRDAPP_ARGS="--threshold-db 12 --maximum 50".
+  # GNU Radio observer (github.com/rajb245/ocudu-dapp-gnuradio): subscribes to
+  # the gNB's uplink resource grid over E3AP (stream classc.spectrum). Nothing
+  # is loaded into the gNB. GRDAPP_SCRIPT picks spectrum_threshold_dapp.py
+  # (default) or fsk_demod_dapp.py; GRDAPP_ARGS passes options, e.g.
+  # GRDAPP_ARGS="--threshold-db 12 --maximum 50".
   gr-dapp:
     container_name: ocudu_demo_grdapp
     image: ocudu-demo/gr-dapp
@@ -310,9 +287,6 @@ services:
     build:
       context: ../ocudu/docker/grafana
       args:
-        # The Dockerfile's arg is LOGO_SRC and it defaults to the OCUDU mark;
-        # we passed LOGO_URL here for a while, which matches nothing and was
-        # silently ignored. Left unset on purpose.
         GF_VERSION: ${GF_VERSION}
     volumes:
       - grafana-storage:/var/lib/grafana:rw

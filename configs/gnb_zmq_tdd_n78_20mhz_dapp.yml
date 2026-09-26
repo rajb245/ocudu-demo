@@ -1,13 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
 # SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
 # SPDX-License-Identifier: BSD-3-Clause-Open-MPI
-# OCUDU demo cell: TDD n78, 20 MHz, ZeroMQ virtual radio, OAI nrUE as the peer.
+# OCUDU cell on the ZeroMQ virtual radio, with the OAI nrUE as the peer: TDD
+# n78, 20 MHz, 30 kHz SCS, with the dApp runtime and the E3 interface enabled.
 #
-# Derived from the OCUDU reference ZMQ cell config with the
-# dApp runtime, the E3 management/telemetry plane and the metrics websocket
-# turned on.
-#
-#   gnb -c /etc/ocudu/gnb.yml
+#   scripts/up zmq
 
 cu_cp:
   amf:
@@ -27,53 +24,9 @@ ru_sdr:
   device_driver: zmq
   device_args: tx_port=tcp://0.0.0.0:4556,rx_port=tcp://oai_nr_ue:4557
   srate: 23.04
-  # IMPORTANT: this must be well below 0 dB on the ZMQ virtual radio.
-  #
-  # ZMQ carries float32 samples, but OAI's nrUE converts them to its internal
-  # int16 format on receive with a HARD-CODED factor of 32767 and no AGC:
-  # radio/zmq/zmq_simd.h defines c16_t_to_cf_t_factor = 32767.0f, and
-  # zmq_set_gains() in radio/zmq/zmq_radio.cpp is a no-op stub. So whatever
-  # amplitude we put on the wire is what lands in the UE's fixed-point
-  # receive chain, and nothing on the UE side can move it.
-  #
-  # OAI's receiver is designed around TARGET_RX_POWER = 50 dB of digital
-  # power, with a usable window of 35-65 dB (PHY/impl_defs_top.h, where 65 is
-  # commented "Maximum digital power, such that signal does not saturate").
-  # At tx_gain 0 the UE measured SS-RSRP 79.3 dB/RE - 14 dB above that
-  # documented maximum - and its fixed-point chain saturated. The distortion
-  # floor that produced is why higher-order modulation failed while QPSK and
-  # 16QAM were fine: saturation hurts 64QAM far more than 16QAM.
-  #
-  # Measured, MCS uncapped (max_ue_mcs 19), TCP downlink:
-  #   tx_gain   0 -> 524 Kb/s   (SS-RSRP 79.3 dB/RE, saturated)
-  #   tx_gain -20 -> 8.39 Mb/s
-  #   tx_gain -30 -> 8.52 Mb/s  (SS-RSRP 49.3 dB/RE, on OAI's 50 dB target)
-  # The 30 dB change moves digital power by exactly 30 dB, as expected.
-  #
-  # Reading these numbers: the ZMQ virtual radio runs about 5x SLOWER than
-  # real time on this host, so every wall-clock figure above understates the
-  # air interface by that factor. Measured three independent ways during a
-  # saturating downlink: the sample stream carries 35.6 MB/s where real time
-  # needs 23.04 MS/s x 8 B = 175.8 MB/s (4.9x), the scheduler reports 66 Mb/s
-  # against 12.3 Mb/s of iperf goodput (5.4x), and ping RTT is 119 ms instead
-  # of the ~20 ms a real-time TDD cell gives (5.4x). Nothing is lost on the
-  # link - RLC retransmissions, HARQ nok and UE tun drops are all zero, and
-  # the nrUE sits at 10% of one core because it sees 5x fewer slots per
-  # second. UDP offered above ~12 Mb/s simply overruns wall-clock capacity.
-  #
-  # So on the air this cell now runs MCS 27 (256QAM, the top of the qam256
-  # table) at 66 Mb/s with 0% BLER and CQI 15. The ~12 Mb/s an attendee will
-  # see over ZMQ is the virtual radio's speed, not a link limitation.
-  #
-  # Note 0 dB is not merely a bad default, it is the CEILING: the validator
-  # in lib/radio/zmq/radio_config_zmq_validator.cpp rejects any gain > 0 dB
-  # ("Channel gain must be <= 0.0 dB for ZMQ-device"). An earlier attempt to
-  # tune this by sweeping tx_gain 0 to 60 therefore changed nothing, because
-  # every positive value was refused - which is what made the gain look inert
-  # and sent the investigation off toward the UE receiver and the MCS cap.
-  #
-  # This is ZMQ-only. On a real USRP tx_gain is an RF gain in dB and the
-  # normal positive values apply; see gnb_rf_x310_tdd_n78_20mhz_dapp.yml.
+  # Digital amplitude on the ZMQ link, <= 0 dB. The OAI nrUE has no AGC on ZMQ;
+  # -30 puts its receive level at OAI's 50 dB target. At 0 its receiver
+  # saturates and higher MCS fail.
   tx_gain: -30
   rx_gain: 0
 
@@ -85,11 +38,6 @@ cell_cfg:
   plmn: "00101"
   tac: 7
   pci: 1
-  # No max_ue_mcs cap is needed. An earlier revision of this file capped DL
-  # MCS at 10 to work around collapsed downlink throughput; the real cause
-  # was ru_sdr.tx_gain above, and with that fixed the full MCS range works.
-  # See the tx_gain comment for the root cause and the measurements.
-
   tdd_ul_dl_cfg:
     dl_ul_tx_period: 5
     nof_dl_slots: 3
@@ -103,26 +51,16 @@ cell_cfg:
     formats: f1_and_f2
     nof_cell_csi_res: 1
 
-# dApp runtime and the embedded E3 plane.
-#
-# Lab posture: unsigned packages are admitted and the E3AP endpoint listens on
-# the container's RAN address so the Python clients can reach it from the host.
-# e3ap_sctp has NO authentication - anything that reaches the port gets full
-# management authority (UE release/handover, RF gain, dApp lifecycle). Keep it
-# inside the compose network or behind a boundary; see docs/dapp/security_model.md.
+# Unsigned packages are admitted, and E3AP listens on the container's RAN
+# address so clients can reach it from the host. The E3 endpoints have no
+# authentication: keep them inside the compose network.
 dapp:
   catalog_root: /opt/ocudu/dapps
   native_preflight_helper: /opt/ocudu/bin/ocudu-dapp-preflight
   package_signature_mode: allow_unsigned
-  # minimum_trust_policy_epoch defaults to 1, and the validator rejects a
-  # nonzero epoch when no trust store is configured - so an unsigned lab
-  # catalog has to zero it explicitly.
+  # Required with allow_unsigned (no trust store).
   minimum_trust_policy_epoch: 0
-  # Declared, not started: these appear in `dappctl inventory` and can be
-  # driven through load -> prepare -> arm -> shadow -> activate over E3 while
-  # the cell is on the air. Add initial_instances to start one at boot instead.
-  # The SDK also stages failure_* and test_* fixtures in the same directory;
-  # those are deliberately left undeclared.
+  # Declared, not started: load and activate them over E3 (see README).
   package_manifests:
     - ref_channel_estimator_cpu.manifest.json
     - ref_equalizer_cpu.manifest.json
@@ -142,16 +80,8 @@ dapp:
     port: 38472
 
 expert_phy:
-  # Run the uplink PHY on uplink slots that carry no PUCCH/PUSCH/SRS PDUs.
-  # Off upstream by default. With it off the FAPI translator returns early on
-  # an empty UL_TTI.request, so the upper PHY never activates a slot and the
-  # Class-C spectrum tap never fires: the E3 spectrum stream publishes nothing
-  # at all until a UE attaches. That defeats the point of the interface, which
-  # is passive monitoring of uplink emissions and interference whether or not
-  # anything is scheduled. Measured on the X310 cell, 2026-09-19, no UE:
-  #   false -> 0 detections in 3 min, and the observer dApp restart-loops on
-  #            the 30 s E3 idle timeout because nothing keeps it alive
-  #   true  -> 1833 detections in 2 min, 1 restart, 0 real-time failures
+  # Run the uplink PHY on empty uplink slots, so the E3 spectrum stream
+  # publishes whenever the UE is sending samples.
   allow_request_on_empty_uplink_slot: true
 
 metrics:

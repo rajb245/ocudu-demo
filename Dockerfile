@@ -5,20 +5,13 @@
 # OCUDU ZMQ demo image: gNB with the dApp runtime, the embedded E3 plane and
 # (optionally) the CUDA-accelerated L1, built for a ZeroMQ virtual radio.
 #
-# Recipe follows the Dockerfile in ocudu-dapp-quickstart (asn1c fork with
-# -gen-APER, flatc, asn1tools venv, clang) with ZeroMQ added for the
-# virtual-radio demo and UHD kept for split-8 USRPs. DPDK stays off (no
-# split-7.2 fronthaul here). That repo is a reference, not an input: nothing
-# here reads it, so bootstrap.sh does not clone it. It is public at
-# https://gitlab.com/ocudu/work_groups/wg2_ai_ran/ocudu-dapp-quickstart.
+# ZeroMQ and UHD (split 8) are both enabled; DPDK is off. Build context is the
+# workspace root holding ocudu/ and ocudu-dapp-sdk/.
 #
-# Build context is the workspace root holding ocudu/ and ocudu-dapp-sdk/.
+#   docker compose -f demo/docker-compose.yml build gnb                                   # CPU
+#   docker compose -f demo/docker-compose.yml -f demo/docker-compose.cuda.yml build gnb   # CUDA
 #
-#   docker compose -f demo/docker-compose.yml build gnb        # CPU L1
-#   docker compose -f demo/docker-compose.yml build gnb-cuda   # CUDA L1
-#
-# CPU and CUDA are the same stages with a different BASE_IMAGE, so only the
-# variant you ask for is ever built.
+# CPU and CUDA differ only in BASE_IMAGE.
 
 ARG BASE_IMAGE=ubuntu:24.04
 
@@ -76,13 +69,8 @@ ARG OCUDU_CXX_COMPILER=clang++
 # runs is a device_driver choice in the gNB YAML.
 ARG OCUDU_ENABLE_UHD=ON
 
-# ENABLE_WERROR defaults ON upstream and the CUDA-only header
-# lib/phy/upper/resource_grid_cuda_visible_impl.h declares a dead private
-# field (host_shadow_from_index, one occurrence in the whole tree), which
-# clang rejects as -Werror,-Wunused-private-field. It only bites when
-# ENABLE_CUDA=ON, so the CPU image never sees it. Warnings are still printed;
-# they just do not fail a build of a branch we are consuming, not developing.
-# Drop this once the declaration is removed upstream.
+# Warnings do not fail the build: the CUDA build otherwise stops on an unused
+# private field in an upstream header.
 
 WORKDIR /work
 COPY ocudu /work/ocudu
@@ -111,10 +99,8 @@ RUN --mount=type=cache,id=ocudu-demo-ccache,target=/root/.cache/ccache \
 # Host gate: the dApp runtime and the E3 codecs, before anything is packaged.
 # The seccomp negative case cannot run under Docker's own seccomp filter.
 #
-# A CUDA build cannot run these here: the binaries link libcuda.so.1, which the
-# container runtime injects only at run time with --gpus, so an image build has
-# no driver. Upstream defers its GPU gates for the same reason. Run them after
-# the build instead, with the GPU attached:
+# A CUDA build skips these (no GPU during an image build). Run them after the
+# build, with the GPU attached:
 #
 #   docker compose -f demo/docker-compose.yml -f demo/docker-compose.cuda.yml \
 #     --profile gates run --rm gates
@@ -152,16 +138,12 @@ RUN --mount=type=cache,id=ocudu-demo-sdk-ccache,target=/root/.cache/ccache \
 # ---------------------------------------------------------------------------
 FROM dapp-sdk AS release
 
-# ethtool for scripts/veth-sctp-crc-off.sh (SCTP CRC offload workaround on
-# old kernels - see the script). Tiny; installed here so the release layer
-# is the only one that changes.
+# ethtool for scripts/veth-sctp-crc-off.sh.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ethtool \
   && rm -rf /var/lib/apt/lists/*
-# From a NAMED context, not a path under the build context. The build
-# context is the workspace root, so a literal "demo/..." here breaks the
-# moment this directory is called anything else - which it is in the staged
-# public copy. The named context is wired to this directory in compose.
+# From the named "demo" context (this directory, wired in compose), so the
+# clone can have any name.
 COPY --from=demo scripts/veth-sctp-crc-off.sh /usr/local/bin/veth-sctp-crc-off
 
 # The dapp_sdk install component ships the packaging tools but not the two

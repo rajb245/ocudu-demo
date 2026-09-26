@@ -4,10 +4,8 @@
 # OAI nrUE for the demo, plus the network tools needed to actually show
 # traffic going through the cell.
 #
-# This is now the only home of the recipe. The `deps` and `builder` stages
-# began as a copy of a DeepSig-internal OAI recipe and this is now their only
-# home, so there is nothing to keep in sync. The OAI source itself is still fetched by BuildKit from the Duranta
-# fork as the `src` remote context.
+# The OAI source is fetched by BuildKit from ${OAIUE_REPO}#${OAIUE_BRANCH}
+# (see .env) as the `src` remote context.
 #
 
 ARG OS_VERSION=24.04
@@ -44,15 +42,8 @@ RUN if [ -z "$NUM_JOBS" ]; then NUM_JOBS=$(nproc); fi && \
 RUN cp -r /opt/openairinterface5g/cmake_targets/ran_build /tmp/ran_build && rm -rf /opt/openairinterface5g
 
 # ---------- Stage: PHY link-level simulators (diagnostics, not the demo) ----------
-# OAI's own link-level simulators: nr_dlsim runs the real gNB transmit chain
-# and the real nrUE receive chain against a configurable channel, with no
-# radio, no scheduler and no TCP, and reports BLER directly. nr_dlschsim is
-# the coding chain without OFDM or channel estimation, and ldpctest is the
-# decoder alone - so the three together bisect a receive-side failure by
-# layer instead of inferring it from throughput.
-#
-# Built from the same deps stage, so it costs a compile and no new downloads.
-# Not part of any demo image: build it explicitly when you need it.
+# OAI link-level simulators (nr_dlsim, nr_dlschsim, ldpctest). Not used by the
+# demo; build explicitly if wanted:
 #
 #   docker build --target sims -t ocudu-demo/oai-sims \
 #     --build-context src=https://github.com/duranta-project/openairinterface5g.git#<commit> .
@@ -64,35 +55,21 @@ RUN if [ -z "$NUM_JOBS" ]; then NUM_JOBS=$(nproc); fi && \
     ls ran_build/build/nr_dlsim ran_build/build/nr_dlschsim ran_build/build/ldpctest
 
 # ---------- Stage 3a: USRP builder ----------
-# A second build of the same source selecting the USRP device library, for a
-# UE with a real radio (B200mini over USB3). build_oai's -w picks exactly one
-# device library, so this cannot be folded into the ZMQ build above; it forks
-# from the shared deps stage instead, so only the compile repeats.
+# The same source built with the USRP device library, for the B200mini UE.
 FROM deps AS builder-usrp
 
 ARG NUM_JOBS=""
 
-# TS 38.214 6.2.2: a PUSCH scheduled by DCI format 0_0 uses the DEFAULT
-# dmrs-AdditionalPosition, not the dedicated one. The nrUE applies the dedicated
-# value for every DCI format, which is invisible at the pos2 default and a hard
-# attach failure when the cell sets pos1: msg5 never decodes, RLC hits max
-# retransmissions and the UE loops through random access (measured on this
-# bench, 2026-09-18). Only a cell that sets dmrs_additional_position: 1 needs
-# it, so carry the fix to make such a cell demonstrable.
-#
-# Patched in the USRP builder only: the ZMQ UE has no reason to diverge from
-# upstream, and the two builders already share the `deps` stage cache.
+# TS 38.214 6.2.2: PUSCH scheduled by DCI 0_0 uses the default
+# dmrs-AdditionalPosition. Without this patch the nrUE cannot attach to a cell
+# that sets dmrs_additional_position: 1. USRP UE only.
 COPY --from=demo patches/oai/0001-nrue-dci00-dmrs-additional-position.patch /tmp/
 RUN cd /opt/openairinterface5g \
     && patch -p1 --forward --batch < /tmp/0001-nrue-dci00-dmrs-additional-position.patch \
     && grep -q "dci_format != NR_UL_DCI_FORMAT_0_0" openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c \
     && echo "nrUE DCI-0_0 DMRS patch applied"
 
-# UHD's public headers include Boost, and libuhd-dev does not pull the Boost
-# headers under --no-install-recommends, so the USRP device library fails with
-# "uhd/config.hpp: fatal error: boost/config.hpp: No such file or directory".
-# Ninja keeps scheduling other work for ~40s after that, so the real error ends
-# up buried well above the failing step in the log.
+# UHD's headers need the Boost headers, which libuhd-dev does not pull in.
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
     && apt-get install -y --no-install-recommends \
         libuhd-dev uhd-host \

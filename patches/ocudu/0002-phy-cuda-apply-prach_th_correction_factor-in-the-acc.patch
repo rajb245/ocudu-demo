@@ -19,7 +19,6 @@ generic detector scales the same threshold and does not do this.
 Scale it in compute_geometry(), exactly as prach_detector_generic_impl
 does, and pass the configured value through the factory.
 
-(cherry picked from commit a91c2abeefe57fc420b39a2728bc7a5add8f8765)
 ---
  .../upper/channel_processors/prach/factories.cpp   |  8 ++++++--
  .../prach/prach_detector_cuda_impl.cpp             | 14 ++++++++++++--

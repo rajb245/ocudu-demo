@@ -3,7 +3,13 @@
 # Shared by up_e3 / down_e3. Works against whichever cell is already running:
 # the USRP cell (radio profile) or the ZMQ one. Never touches the cell itself.
 demo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CUDA="-f ${demo}/docker-compose.yml -f ${demo}/docker-compose.cuda.yml"
+# Base file ONLY - deliberately NOT the cuda overlay. These scripts act only on
+# the gr-dapp / gr-dapp-usrp observer, which the overlay never touches. Passing
+# the overlay made compose re-resolve the gnb dependency to ocudu-demo/gnb:cuda;
+# on a CPU box that image does not exist, so "up_e3" fell through to a ~20-minute
+# CUDA gNB build instead of just (re)starting the observer. up_e3 also runs
+# up with --no-deps so the running cell is never recreated regardless of build.
+COMPOSE_BASE="-f ${demo}/docker-compose.yml"
 
 running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == true ]]; }
 
@@ -16,6 +22,6 @@ else
   exit 1
 fi
 
-CO=(docker compose $CUDA --profile "$PROFILE")
+CO=(docker compose $COMPOSE_BASE --profile "$PROFILE")
 subs() { docker exec $GNB ocudu-dappctl inventory 2>/dev/null | grep -c '^  subscription'; }
 det()  { docker logs $DAPP 2>/dev/null | grep -ac '"prb"'; }

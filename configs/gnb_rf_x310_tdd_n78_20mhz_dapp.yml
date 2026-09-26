@@ -1,37 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
 # SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
 # SPDX-License-Identifier: BSD-3-Clause-Open-MPI
-# OCUDU cell on an Ettus X310 as the split-8 RU: TDD n78, 20 MHz, 30 kHz SCS,
-# with the dApp runtime and the E3 plane enabled.
+# OCUDU cell on an Ettus X310 (UBX-160) as the split-8 RU: TDD n78, 20 MHz,
+# 30 kHz SCS, with the dApp runtime and the E3 interface enabled.
 #
-# Hardware-verified, not yet on air. Probed against the X310 in use here:
-# FPGA image HG (10 GbE on SFP+ port 1), two UBX-160 daughterboards, each
-# 10 MHz - 6 GHz TX and RX with 0-31.5 dB gain and 160 MHz bandwidth, so n78 at
-# 3489.42 MHz is well inside range. No GPSDO is fitted - the mboard exposes only
-# ref_locked, not gps_locked/gps_time - hence internal clock and sync below.
-# Gains are still first guesses; set them against your own RF path.
+#   scripts/up
 #
-#   docker compose -f demo/docker-compose.yml --profile radio up gnb-usrp
-#
-# Host prep, none of which the container can do for you:
-#   - 10 GbE link to the X310, jumbo frames (MTU 9000) on that interface
-#   - a host address on the device's subnet: 192.168.40.1/24 for SFP+ port 1
-#     under the HG image (port 0 is 1 GbE there); XG puts port 0 on
-#     192.168.30.2 instead
-#   - sysctl net.core.wmem_max / rmem_max raised (UHD warns loudly if not)
-#   - uhd_find_devices sees the X310 and reports its daughterboards
-#   - the device FPGA matches the host UHD (4.6 wants compat 39.0; an older
-#     image fails the probe outright and needs uhd_image_loader plus a
-#     power cycle)
-#   - nothing else holding the device
+# Host prep (outside the container):
+#   - 10 GbE link to the X310 on SFP+ port 1 (HG FPGA image), MTU 9000
+#   - host address 192.168.40.1/24 on that interface; the radio is 192.168.40.2
+#   - sysctl net.core.wmem_max / rmem_max = 62914560
+#   - X310 FPGA image compatible with the UHD in the image (compat 39 for UHD 4.6;
+#     update with uhd_image_loader and power-cycle)
+#   - 10 MHz reference into REF IN
 
 cu_cp:
   amf:
     no_core: false
     addr: 10.53.1.2
     port: 38412
-    # Host networking: the gNB binds a host address that can route to the 5GC
-    # container, which is the docker bridge gateway for the ran network.
+    # Host networking: the ran network's bridge gateway, which routes to the 5GC.
     bind_addr: 10.53.1.1
     supported_tracking_areas:
       - tac: 7
@@ -41,106 +29,27 @@ cu_cp:
               - sst: 1
   inactivity_timer: 7200
 
-# Antenna wiring this config assumes (X310, RF A only):
-#
-#   RF A TX/RX  -> antenna, downlink      RF B  unused (second UBX-160)
-#   RF A RX2    -> antenna, uplink
-#
-# UBX TX offers only TX/RX (plus CAL), and UHD's default RX antenna on a UBX is
-# RX2, so the two-antenna layout above is exactly what the driver does with no
-# antenna selection at all. Nothing in OCUDU sets antennas by name; the only
-# knob is expert_cfg.tx_mode below.
+# Antennas: RF A TX/RX = downlink, RF A RX2 = uplink. RF B is unused.
 ru_sdr:
   device_driver: uhd
-  # master_clock_rate 184.32e6 is the X3x0 default the driver sets anyway
-  # (lib/radio/uhd/radio_uhd_device.h); stated here so it is visible. The
-  # frame sizes are likewise the defaults for network-attached USRPs.
-  # addr pins this to the probed device; drop it to take whatever is found.
   device_args: type=x300,addr=192.168.40.2,master_clock_rate=184.32e6,send_frame_size=8000,recv_frame_size=8000
-  # 184.32 / 23.04 = 8, an integer decimation - keep that relationship if you
-  # change the bandwidth.
+  # Must divide master_clock_rate (184.32 / 23.04 = 8).
   srate: 23.04
-  # No GPSDO on this unit, so internal it is. "gpsdo" appears in the X310's
-  # advertised clock/time sources regardless of whether the board is fitted -
-  # selecting it without the hardware fails at runtime. An external 10 MHz +
-  # PPS would work (the mboard does expose ref_locked); a single TDD cell does
-  # not need either.
-  # OctoClock 10 MHz into the X310's REF IN. Verified with the ref_locked
-  # mboard sensor reading true and stable. sync stays internal because only the
-  # reference is wired, not PPS - selecting sync: external without a PPS input
-  # leaves the radio waiting for an edge that never arrives.
-  # Radio RX-to-TX delay calibration, in samples at srate (positive = transmit
-  # earlier relative to receive). Upstream and this branch hardcode 0 for
-  # "auto"; nothing ships a value for any USRP. It decides whether Msg3 lands
-  # inside the PUSCH cyclic prefix (~2.3 us at 30 kHz) - PRACH format 0 does not
-  # care (~100 us window), which is why PRACH worked long before Msg3 did.
-  # Measured Msg3 first-attempt decode:  0 -> 16%   -300 -> 36%   -128 -> 10%
-  #   +128 -> 55% with contention resolution clean   +300 -> lower-PHY
-  #   "PRACH request late" real-time failures, then SIGSEGV.
-  # Noisy and non-monotonic; +128 is the working point, not a proven optimum.
+  # RX-to-TX timing calibration in samples; X310/UBX-specific. Msg3 decode
+  # depends on it.
   time_alignment_calibration: 128
+  # 10 MHz reference on REF IN; no PPS, so sync stays internal.
   clock: external
   sync: internal
-  # An OctoClock (10 MHz + PPS) on the X310 alone is worth doing and is the
-  # easy half: set clock: external and sync: external. Disciplining only the
-  # gNB still helps, because the UE tracks whatever carrier the cell radiates -
-  # it removes the gNB's drift from the budget rather than cancelling the
-  # offset outright. If both ends are ever referenced, revisit the expert_phy
-  # CFO settings below, which upstream notes can be counterproductive with a
-  # good clock.
-  # UBX-160 tops out at 31.5 dB on both TX and RX - values above that are
-  # clamped, not errors, so they fail quietly.
-  # Gains do NOT transfer between daughterboards. Upstream's B200 example uses
-  # tx_gain 80 / rx_gain 40 on a board whose range is 0-89.8 TX and 0-76 RX;
-  # UBX-160 is 0-31.5 on both, so the numbers below sit at a comparable
-  # fraction of range, not at comparable values. Over the air at bench
-  # distance the UE is deep in the near field, so start low and raise only if
-  # SSB is not found. Values above 31.5 are clamped, not rejected.
-  #
-  # rx_gain is the uplink. Measured with the B200mini UE ~1 m away, UE at its
-  # default drive (--ue-txgain 10), tx_mode continuous, cal 128:
-  #   rx_gain 31 -> pusch -15 dB, BLER 96%, TCP uplink carries nothing
-  #   rx_gain 21 -> pusch  -6 dB, BLER 33%
-  #   rx_gain 11 -> pusch  +2 dB, BLER 1-2%, UDP 0% loss to 8 Mb/s,
-  #                 TCP 1.0 Mb/s up / 3.8 Mb/s down, DL CQI 15
-  # Lowering the UE's transmit power instead (p0_nominal_with_grant -76 ->
-  # -100, phr 4 -> 27) left pusch unchanged at -6 dB, so this is the gNB
-  # front end being overdriven, not the UE shouting. Raise rx_gain only if
-  # the UE is moved well away from the X310, and watch `pusch` in the metrics
-  # table as you do: it must go UP when the gain goes down.
-  #
-  # tx_gain is ALSO the uplink. With rx_gain 11 the idle uplink was fine but
-  # a downlink iperf run pulled pusch down to ~0 dB with 56% BLER: the gNB's
-  # own PDSCH desenses its receiver. Measured under a 10 s DL TCP run, same
-  # bench, UE attached each time:
-  #   tx_gain 30 -> pusch  0.8 dB in DL, UL BLER 56%, DL  7.8 Mb/s, UL 1.7 Mb/s
-  #   tx_gain 20 -> pusch 13.2 dB in DL, UL BLER 14%, DL 12.6 Mb/s, UL 6.1 Mb/s
-  #   tx_gain 12 -> pusch 14.3 dB in DL, UL BLER 13%, DL 15.1 Mb/s, UL 7.9 Mb/s
-  # DL stayed at CQI 15 throughout at 1 m; the UE reports PHR 0 below 30, i.e.
-  # it is at full power, which is fine on the bench. Lower still was not
-  # tried. Raise tx_gain only with distance, and re-check `pusch` under load.
+  # UBX-160 range is 0-31.5 dB. Set for a UE about 1 m away. For a more distant
+  # UE raise both, watching `pusch` in the metrics table during a downlink
+  # iperf: too much gain on either lowers it.
   tx_gain: 12
   rx_gain: 11
   expert_cfg:
-    # continuous: TX stays on TX/RX, RX stays on RX2 - two antennas, which is
-    #   the wiring above.
-    # same-port:  TDD only, makes the radio receive on the TX antenna so a
-    #   single antenna serves both. Switch to this if RF A RX2 is unpopulated.
-    # discontinuous: TX chain idles between bursts (start/end-of-burst per DL
-    #   burst, power_ramping_time_us defaults to 0). Tested here as a fix for
-    #   the uplink and it did the opposite: at rx_gain 21 pusch fell from -6 dB
-    #   to -26 dB with 100% BLER, and TA went negative, i.e. the burst gating
-    #   moves the TX timeline that time_alignment_calibration was tuned under.
-    #   Leave continuous on the X310.
+    # continuous: two antennas (TX/RX + RX2). Use same-port for a single antenna.
     tx_mode: continuous
-    # GPU PRACH demodulation in the lower PHY. Validated over the air on
-    # 2026-09-18 with the patches/ocudu build: 0 real-time failures,
-    # attach in 10 s, full throughput. It still logs ~14 "PRACH buffer pool
-    # depleted" lines in the first 200 ms after "gNB started" - its VkFFT plan
-    # is built lazily on the first PRACH occasion (same class as the upper-PHY
-    # bug that was fixed; harmless, nobody RACHes that early; follow-up).
-    # The stall this used to be blamed for was the upper-PHY detector's JIT.
-    # auto | enabled | disabled.
+    # auto | enabled | disabled
     low_phy_prach_demodulation_acceleration_mode: auto
 
 cell_cfg:
@@ -151,34 +60,15 @@ cell_cfg:
   plmn: "00101"
   tac: 7
   pci: 1
-  # PRACH. The auto-selected index for FR1 TDD is 159 = format B4 (l139, short,
-  # 30 kHz). Over the air that preamble is NEVER detected: the short format's
-  # cyclic prefix leaves almost no tolerance to transmit-timing error, and a
-  # real radio has some. The identical configuration attaches over ZMQ, where
-  # samples arrive sample-exact, which is why this hides completely in
-  # simulation.
-  #
-  # Index 7 selects format 0 (long, L=839, 1.25 kHz SCS): every frame,
-  # subframe 9 = slots 18-19, both UL in the pattern above. With it the gNB
-  # detects preambles immediately, answers with a RAR and schedules Msg3.
-  #
-  # preamble_rx_target_pw is the open-loop target at the gNB; the UE transmits
-  # min(P_CMAX, target + pathloss), so at bench range it sends a weak preamble
-  # regardless of its hardware TX gain. Raised from the -100 default.
-  # zero_correlation_zone stays at the default 0. Swept 0/4/8/11/13/15 over the
-  # air (8 UE preambles per arm): only 0, 8 and 11 ever matched a transmitted
-  # preamble at the gNB (2, 1 and 1 of 8), none of the others detected
-  # anything, and 14/15 are marked unsupported in the detector threshold
-  # table. Msg3 timing, not the ZCZ, turned out to be what blocked attach.
+  # Format 0 (long preamble). The auto-selected short format is not detected
+  # over the air.
   prach:
     prach_config_index: 7
     preamble_rx_target_pw: -80
 
-  # One UBX-160 (RF A) in use: a 1x1 cell. The second board is spare.
   nof_antennas_dl: 1
   nof_antennas_ul: 1
-  # dl_ul_tx_period is in SLOTS. 10 slots at 30 kHz SCS = 5 ms, and gives three
-  # UL slots per period instead of one.
+  # dl_ul_tx_period is in slots: 10 slots = 5 ms at 30 kHz SCS.
   tdd_ul_dl_cfg:
     dl_ul_tx_period: 10
     nof_dl_slots: 6
@@ -208,8 +98,8 @@ dapp:
     socket_path: /run/ocudu/dapp-management.sock
     request_timeout_ms: 1000
   e3ap_sctp:
-    # Host networking puts this on a real interface. Loopback unless you have
-    # a network boundary in front of it - the endpoint has no authentication.
+    # The E3 endpoints have no authentication. Keep them on loopback unless a
+    # network boundary protects them.
     bind_address: 127.0.0.1
     port: 36423
     ran_identifier: ocudu-x310-gnb
@@ -217,53 +107,19 @@ dapp:
     bind_address: 127.0.0.1
     port: 38472
 
-# Both ends of this link run free-running TCXOs - the X310 has no GPSDO and the
-# B200mini UE none either - so there is real carrier frequency offset between
-# them. Upstream configs/gnb_rf_b200_tdd_n78_20mhz.yml sets exactly this for
-# USRP front ends, noting that with a disciplined clock the defaults may do
-# better. Revisit if an external 10 MHz reference is ever fitted.
 expert_phy:
-  # Run the uplink PHY on uplink slots that carry no PUCCH/PUSCH/SRS PDUs.
-  # Off by default, and with it off the FAPI translator returns early on an
-  # empty UL_TTI.request, so the upper PHY never activates a slot and the
-  # Class-C spectrum tap never fires. The result is that the E3 spectrum
-  # stream publishes nothing at all until a UE attaches, which defeats the
-  # point of it: passive monitoring of uplink emissions and interference
-  # needs the grid whether or not anything is scheduled. Measured here,
-  # 2026-09-19, no UE anywhere:
-  #   false -> 0 detections in 3 min, and the observer dApp restart-loops
-  #            because the E3 association idles out after 30 s with no traffic
-  #   true  -> 1833 detections in 2 min, 1 restart, 0 real-time failures
+  # Run the uplink PHY on empty uplink slots, so the E3 spectrum stream
+  # publishes with no UE attached.
   allow_request_on_empty_uplink_slot: true
-  # PRACH false-alarm control. The detector's table entry for
-  # {format 0, ZCZ 0, 1 Rx port} has the lowest threshold in the table (0.147)
-  # and is flagged 'orange' (unvalidated). At the default 1.0 the gNB reports
-  # ~3.5 phantom preambles per minute with the UE switched OFF - random index,
-  # random TA, and a RAR for each - which masked the fact that the real
-  # preamble was never being detected. 4.0 gave 0 false alarms in 150 s while
-  # real detections came through at the UE's exact SFN and index.
+  # Raises the PRACH detection threshold; suppresses false preambles with
+  # format 0.
   prach_th_correction_factor: 4.0
-  # CUDA upper PHY on the radio path. The old "50 real-time failures and a
-  # stall ~1 s in" was the GPU PRACH detector compiling its VkFFT kernel with
-  # NVRTC on the first detection, on a shared worker; fixed by
-  # patches/ocudu/0001 (warm-up at construction + kernel cache).
-  # Same-session OTA A/B, 2026-09-18, one arm
-  # each, UE at 1 m:
-  #   all auto (PUSCH on GPU)      0 rt-failures  UL 3.5 Mb/s  DL 15.6 Mb/s  UL MCS stuck 2-4 at 12 dB, 0% BLER
-  #   pusch disabled, rest auto    0 rt-failures  UL 7.9 Mb/s  DL 19.0 Mb/s  <- this file
-  #   all disabled                 0 rt-failures  UL 7.0 Mb/s  DL 15.5 Mb/s
-  # PUSCH stays on the host: the GPU PUSCH path holds UL link adaptation at
-  # MCS 2-4 with 0% BLER (its post-EQ SINR reaches the scheduler through a
-  # calibration in pusch_demodulator_gpu_impl.cpp) - a reporting issue to fix
-  # before it earns its place, not a timing one. pdsch "auto" selects the host
-  # backend on a discrete GPU by design (OCUDU_PDSCH_AUTO_ENABLE_DISCRETE=1).
+  # GPU acceleration per channel: auto | enabled | disabled. PUSCH stays on the
+  # CPU.
   pdsch_acceleration_mode: auto
   pusch_acceleration_mode: disabled
   prach_acceleration_mode: auto
   srs_acceleration_mode: auto
-  # The free-running-clock estimator overrides (td_strategy: average,
-  # cfo_compensation: true) are gone: both radios sit on the OctoClock now and
-  # upstream notes they can be worse with a disciplined reference.
 
 metrics:
   autostart_stdout_metrics: true
@@ -275,16 +131,9 @@ remote_control:
 
 log:
   filename: /tmp/gnb.log
-  # warning, not info: at info the PHY logs a line per slot ("PDSCH grid path:
-  # ...") which is 2000 lines/second into a file and is enough on its own to
-  # miss the slot deadline - the symptom is "Real-time failure in FAPI:
-  # Received late DL_TTI.request" and then the cell stops. Upstream's USRP
-  # reference config (configs/gnb_rf_b200_tdd_n78_20mhz.yml) uses warning for
-  # the same reason. ZMQ tolerates info because it paces itself; a radio does
-  # not.
+  # Keep at warning on a real radio: info-level PHY logging misses slot
+  # deadlines.
   all_level: warning
-  # RACH indications are logged by MAC at info; the PHY per-slot spam that
-  # breaks the slot deadline is not.
   mac_level: info
   hex_max_size: 0
 

@@ -9,9 +9,11 @@
 #   scripts/up zmq        # 5gc + gnb + oaiue + gr-dapp     (no hardware)
 #   scripts/up zmq ui     # the above plus Grafana on :3300
 #
-# Both compose files are always passed. The CUDA overlay alone has no command,
-# no volumes and no host networking, so compose would silently start the
-# image's default shell and exit 0 with no cell and no error.
+# _profiles picks CPU or CUDA and passes the base compose file always, adding
+# the CUDA overlay only when it has chosen CUDA (preferring whichever image is
+# already built). The overlay is never passed alone: on its own it has no
+# command, no volumes and no host networking, so compose would silently start
+# the image's default shell and exit 0 with no cell and no error.
 set -euo pipefail
 here="$(dirname "${BASH_SOURCE[0]}")"
 . "${here}/_profiles"

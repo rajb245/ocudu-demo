@@ -103,11 +103,8 @@ echo
 if (( bad )); then
   printf '  \033[31m%d check(s) failed\033[0m - the first FAIL above is the one to chase\n' "$bad"
   if (( link_lost )); then
-    echo "  The UE attached earlier and has lost the cell since."
-    echo "  It will NOT recover on its own. Measured: with the cell back up and"
-    echo "  healthy for 8 minutes the UE kept re-scanning and the gNB saw zero"
-    echo "  RA attempts; a restart then attached in 8 s. Its re-sync loop never"
-    echo "  completes. So after ANY cell bounce, restart the UE:"
+    echo "  The UE attached earlier and has lost the cell since. It does not"
+    echo "  recover on its own; after any cell restart, restart the UE:"
     echo "    scripts/check     # on the gNB host - confirm the cell is back first"
     echo "    scripts/down_ue && scripts/up_ue"
   else

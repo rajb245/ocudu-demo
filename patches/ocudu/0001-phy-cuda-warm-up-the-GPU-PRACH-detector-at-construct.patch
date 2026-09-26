@@ -32,7 +32,6 @@ The geometry derivation and backend configuration fill move into
 compute_geometry() and make_cuda_config() so the warm-up and the live path
 cannot drift apart.
 
-(cherry picked from commit 3c9280d751ff3aa270a695713b40883814830a13)
 ---
  .../o_du_low/du_low_config_translator.cpp     |   1 +
  .../channel_processors/prach/factories.h      |   9 ++

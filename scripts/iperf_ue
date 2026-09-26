@@ -29,10 +29,8 @@ CORE_IP=10.45.1.1
 # Delegate to the gNB-host script so there is one definition of how the
 # servers are started, and it is idempotent.
 start_servers() { "$(dirname "${BASH_SOURCE[0]}")/iperf_server" >/dev/null 2>&1; }
-# Deliberately NO reachability probe first. The servers are started -1, so a
-# probe that opens a TCP connection IS their one client and they exit before
-# iperf3 arrives - which cost a run to find. If the core is elsewhere, just
-# try, and explain on refusal.
+# No reachability probe first: a probe connection would consume a one-shot
+# server. If the core is elsewhere, just try, and explain on refusal.
 running ocudu_demo_5gc && start_servers
 
 hint() {

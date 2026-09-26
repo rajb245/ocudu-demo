@@ -13,8 +13,7 @@
 #   ocudu/                  the gNB: dApp runtime, E3 plane, CUDA L1.
 #                           Public wg2 platform, pinned, + patches/ocudu here.
 #   ocudu-dapp-sdk/         reference dApp packages built against that host
-#   <this directory>/       Dockerfile, compose, configs. Named demo/ in the
-#                           working repo and demo-public/ in the staged copy;
+#   <this directory>/       Dockerfile, compose, configs. Any name works;
 #                           the script uses whatever it is actually called.
 #
 # Then: cd <workspace> && docker compose -f <this directory>/docker-compose.yml up -d
@@ -22,8 +21,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# What this directory is actually called. The public copy is staged as
-# demo-public/, so nothing user-facing may assume the name "demo".
+# What this directory is actually called. Any name works, so nothing may
+# assume "demo".
 self="$(basename "${here}")"
 
 # The gNB is the public OCUDU WG2 dApp platform at a pinned commit, plus the
@@ -47,10 +46,8 @@ OCUDU_BASE="bc7eaab391ab875a6e67f1ee57bff387a1dbfc5f"
 OCUDU_BRANCH="demo-patched"
 
 # Every ref is a commit, not a branch. The SDK builds against the platform's
-# headers, and its main tracks the platform's main TIP, not this pin: on
-# 2026-09-20 it started using equalized_symbols in ocudu_dapp_receiver_metrics_v1
-# and the gnb image stopped compiling against OCUDU_BASE. These three commits
-# are the set the demo was built and measured with. Move them together.
+# headers, so a newer SDK does not compile against OCUDU_BASE. Move all three
+# together.
 SDK_BASE="c38255585991ad7005737a4308cd433dee5bcfea"        # 2026-09-02
 GRDAPP_BASE="079cf7189173f9b75090b4736f6a68c1bd8bba0f"     # 2026-09-01
 
@@ -141,9 +138,8 @@ for entry in "${repos[@]}"; do
 done
 
 # The gNB and gr-dapp images build with the WORKSPACE as their context, so
-# compose must name this directory to find the Dockerfiles in it. That name is
-# not fixed - the public copy is staged as demo-public/ - so keep .env honest
-# rather than making the reader discover it as "lstat .../demo: no such file".
+# compose must name this directory to find the Dockerfiles in it. Any directory
+# name works, so bootstrap sets DEMO_DIR in .env from it.
 envfile="${here}/.env"
 have_dir="$(sed -n 's/^DEMO_DIR=//p' "${envfile}" 2>/dev/null | head -1)"
 if [[ ! -f "${envfile}" ]]; then
@@ -211,10 +207,7 @@ if (( plugin_fail )) || { (( docker_fail )) && ! command -v docker >/dev/null 2>
 HINT
 fi
 
-# Only demand a git key if something in the table above actually needs one.
-# As of 2026-09-19 nothing does: every repo clones over https, so bootstrap
-# needs no credentials at all. The check stays because putting a private repo
-# back is then a one-line change and this re-arms itself.
+# Only demand a git key if a repo in the table above uses an ssh URL.
 ssh_repos=()
 for entry in "${repos[@]}"; do
   IFS='|' read -r dir url _ _ <<<"${entry}"

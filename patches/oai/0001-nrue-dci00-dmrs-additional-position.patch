@@ -14,14 +14,10 @@ RLC hits max retransmissions, RRC releases, and the UE loops through random
 access forever: "Received indication that RLC reached max retransmissions"
 followed by repeated "RAR reception failed".
 
-Confirmed on this bench 2026-09-18: with cell_cfg.pusch.dmrs_additional_position
-set to 1 the OAI nrUE never attached in 170 s and ended in "max retransmissions";
-at the default pos2 the same UE attached in 10 s.
-
 Only affects a cell configured with cell_cfg.pusch.dmrs_additional_position
 set to 1; a cell at the pos2 default behaves identically either way.
 
-Origin: DeepSig, 2026-08-23, carried here verbatim. Applies to
+Origin: DeepSig, 2026-08-23. Applies to
 github.com/duranta-project/openairinterface5g @ develop, which does not have the
 guard. Upstream OAI status not verified. OAI is under the Collaborative
 Standards Software License v1.0 (LicenseRef-CSSL-1.0, text in LICENSES/);

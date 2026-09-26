@@ -12,7 +12,7 @@
 # Two ports because iperf3 -R reuses the control connection, so uplink and
 # downlink need a server each. Persistent, NOT -1: one-shot servers have to be
 # restarted between every measurement, and anything that opens the port at all
-# consumes them - including a reachability probe, which cost us a run.
+# consumes them.
 set -uo pipefail
 CORE=ocudu_demo_5gc
 PORTS=(7201 7202)

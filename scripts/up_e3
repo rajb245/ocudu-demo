@@ -13,7 +13,9 @@
 # so only the delta tells you the stream actually restarted.
 before=$(det)
 echo "cell: $GNB ($PROFILE)   subscriptions before: $(subs)"
-"${CO[@]}" up -d "$SVC" >/dev/null 2>&1 || { echo "could not start $SVC" >&2; exit 1; }
+# --no-deps: only (re)start the observer. The cell is already running - without
+# this, compose re-evaluates the gnb dependency and can try to recreate it.
+"${CO[@]}" up -d --no-deps "$SVC" >/dev/null 2>&1 || { echo "could not start $SVC" >&2; exit 1; }
 
 for _ in $(seq 20); do sleep 1; [[ $(( $(det) - before )) -gt 0 ]] && break; done
 n=$(( $(det) - before ))
