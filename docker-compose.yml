@@ -13,7 +13,7 @@ services:
   # Open5GS 5G core, built from the platform's docker/ tree.
   5gc:
     container_name: ocudu_demo_5gc
-    image: ocudu-demo/5gc
+    image: ${IMAGE_PREFIX:-ocudu-demo}/5gc
     build:
       context: ../ocudu/docker/open5gs
       target: open5gs
@@ -103,7 +103,7 @@ services:
   # fetched by BuildKit as a remote build context.
   oaiue:
     container_name: oai_nr_ue
-    image: ocudu-demo/oai-nr-ue
+    image: ${IMAGE_PREFIX:-ocudu-demo}/oai-nr-ue
     # ZMQ only: this UE speaks oai_zmqdevif over TCP and cannot reach a gNB
     # that is transmitting from a USRP. An over-the-air cell needs a UE with
     # its own radio, or a COTS handset with a provisioned SIM.
@@ -189,7 +189,7 @@ services:
   # GRDAPP_ARGS="--threshold-db 12 --maximum 50".
   gr-dapp:
     container_name: ocudu_demo_grdapp
-    image: ocudu-demo/gr-dapp
+    image: ${IMAGE_PREFIX:-ocudu-demo}/gr-dapp
     profiles: [zmq]
     build:
       context: ..
@@ -209,7 +209,7 @@ services:
   # with E3AP bound to 127.0.0.1, so this joins the host network too.
   gr-dapp-usrp:
     container_name: ocudu_demo_grdapp_usrp
-    image: ocudu-demo/gr-dapp
+    image: ${IMAGE_PREFIX:-ocudu-demo}/gr-dapp
     profiles: [radio]
     build:
       context: ..
@@ -243,7 +243,7 @@ services:
   # Metrics UI (opt-in): gNB websocket -> telegraf -> InfluxDB -> Grafana.
   telegraf:
     container_name: ocudu_demo_telegraf
-    image: ocudu-demo/telegraf
+    image: ${IMAGE_PREFIX:-ocudu-demo}/telegraf
     profiles: [ui]
     build:
       context: ../ocudu/docker/telegraf
@@ -282,7 +282,7 @@ services:
 
   grafana:
     container_name: ocudu_demo_grafana
-    image: ocudu-demo/grafana
+    image: ${IMAGE_PREFIX:-ocudu-demo}/grafana
     profiles: [ui]
     build:
       context: ../ocudu/docker/grafana

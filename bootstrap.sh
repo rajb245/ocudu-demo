@@ -16,8 +16,21 @@
 #   <this directory>/       Dockerfile, compose, configs. Any name works;
 #                           the script uses whatever it is actually called.
 #
-# Then: cd <workspace> && docker compose -f <this directory>/docker-compose.yml up -d
+# Then build (or pull) the images and run <this directory>/scripts/up zmq.
+#
+#   bootstrap.sh --clone-only   lay out the workspace and set DEMO_DIR, but skip
+#                               the host checks - for CI, where the build host
+#                               need not be able to run the stack.
 set -euo pipefail
+
+clone_only=0
+for arg in "$@"; do
+  case "${arg}" in
+    --clone-only) clone_only=1 ;;
+    -h|--help) sed -n '4,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "bootstrap.sh: unknown argument '${arg}' (try --help)" >&2; exit 2 ;;
+  esac
+done
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -150,6 +163,11 @@ elif [[ -z "${have_dir}" ]]; then
 elif [[ "${have_dir}" != "${self}" ]]; then
   sed -i "s|^DEMO_DIR=.*|DEMO_DIR=${self}|" "${envfile}"
   echo "== set DEMO_DIR=${self} in ${self}/.env (was ${have_dir})"
+fi
+
+if (( clone_only )); then
+  echo "== workspace ready at ${root} (--clone-only: host checks skipped)"
+  exit 0
 fi
 
 echo

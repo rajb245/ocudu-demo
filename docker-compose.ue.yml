@@ -16,14 +16,14 @@
 #
 #   mkdir -p ~/uhd-images
 #   docker run --rm -v "$HOME/uhd-images":/usr/share/uhd/images \
-#     --entrypoint /usr/bin/uhd_images_downloader ocudu-demo/oai-nr-ue:usrp -t b2xx
+#     --entrypoint /usr/bin/uhd_images_downloader <IMAGE_PREFIX>/oai-nr-ue:usrp -t b2xx
 
 name: ocudu-demo-ue
 
 services:
   ue-usrp:
     container_name: oai_nr_ue_usrp
-    image: ocudu-demo/oai-nr-ue:usrp
+    image: ${IMAGE_PREFIX:-ocudu-demo}/oai-nr-ue:usrp
     build:
       context: .
       dockerfile: Dockerfile.oaiue

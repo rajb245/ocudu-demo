@@ -63,9 +63,26 @@ cuda_viable() {
   [[ -n "${drv}" ]] && (( ${drv%%.*} >= 580 ))
 }
 
+# The image names compose will use: the shell environment wins, as it does for
+# compose, then .env, then the defaults. ${IMAGE_PREFIX} inside a value is
+# expanded the way compose expands it.
+env_value() { # KEY
+  local v="${!1:-}"
+  [[ -n "${v}" ]] || v="$(sed -n "s/^$1=//p" "${demo}/.env" 2>/dev/null | tail -1)"
+  printf '%s' "${v}"
+}
+IMAGE_PREFIX_RESOLVED="$(env_value IMAGE_PREFIX)"; IMAGE_PREFIX_RESOLVED="${IMAGE_PREFIX_RESOLVED:-ocudu-demo}"
+image_name() { # KEY DEFAULT_SUFFIX
+  local v; v="$(env_value "$1")"
+  v="${v//\$\{IMAGE_PREFIX\}/${IMAGE_PREFIX_RESOLVED}}"
+  printf '%s' "${v:-${IMAGE_PREFIX_RESOLVED}/$2}"
+}
+GNB_CPU_IMG="$(image_name GNB_IMAGE gnb:cpu)"
+GNB_CUDA_IMG="$(image_name GNB_CUDA_IMAGE gnb:cuda)"
+
 if [[ -z "${CELL_BUILD:-}" ]]; then
-  if   has_img ocudu-demo/gnb:cuda && ! has_img ocudu-demo/gnb:cpu;  then CELL_BUILD=cuda; CELL_WHY="only gnb:cuda is built"
-  elif has_img ocudu-demo/gnb:cpu  && ! has_img ocudu-demo/gnb:cuda; then CELL_BUILD=cpu;  CELL_WHY="only gnb:cpu is built"
+  if   has_img "${GNB_CUDA_IMG}" && ! has_img "${GNB_CPU_IMG}";  then CELL_BUILD=cuda; CELL_WHY="only gnb:cuda is present"
+  elif has_img "${GNB_CPU_IMG}"  && ! has_img "${GNB_CUDA_IMG}"; then CELL_BUILD=cpu;  CELL_WHY="only gnb:cpu is present"
   elif cuda_viable; then CELL_BUILD=cuda; CELL_WHY="docker can drive this GPU"
   else                   CELL_BUILD=cpu;  CELL_WHY="no GPU docker can use"
   fi

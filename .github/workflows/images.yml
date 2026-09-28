@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 DeepSig Inc.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+#
+# Build the CPU images and push them to GitHub Container Registry as
+# ghcr.io/<owner>/ocudu-demo/<name>. Each image is built by the repo's own
+# compose files, exactly as a local `docker compose build` would.
+#
+# Tags pushed per image: the moving tag compose uses (gnb:cpu, 5gc:latest, ...)
+# and an immutable one for this commit (gnb:cpu-<sha>, 5gc:<sha>), plus the
+# release tag when run from a v* tag.
+#
+# To use the images: set IMAGE_PREFIX=ghcr.io/<owner>/ocudu-demo in .env, then
+# `docker compose -f demo/docker-compose.yml --profile zmq pull`.
+
+name: images
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: gnb,            compose: docker-compose.yml,    profile: zmq, service: gnb }
+          - { image: oai-nr-ue,      compose: docker-compose.yml,    profile: zmq, service: oaiue }
+          - { image: oai-nr-ue-usrp, compose: docker-compose.ue.yml, profile: "",  service: ue-usrp }
+          - { image: 5gc,            compose: docker-compose.yml,    profile: "",  service: 5gc }
+          - { image: gr-dapp,        compose: docker-compose.yml,    profile: zmq, service: gr-dapp }
+          - { image: telegraf,       compose: docker-compose.yml,    profile: ui,  service: telegraf }
+          - { image: grafana,        compose: docker-compose.yml,    profile: ui,  service: grafana }
+    env:
+      # One build job per runner core; the repo's .env default assumes a bigger box.
+      NUM_JOBS: "4"
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          docker image prune -af >/dev/null
+          df -h /
+
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          path: demo
+
+      - name: Clone the pinned sources
+        run: demo/bootstrap.sh --clone-only
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        run: |
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_PREFIX=ghcr.io/${owner}/ocudu-demo" >> "$GITHUB_ENV"
+          export IMAGE_PREFIX="ghcr.io/${owner}/ocudu-demo"
+
+          # Labels link each package to this repo on GHCR. Kept in a CI-only
+          # overlay so the repo's compose files stay as attendees use them.
+          cat > "$RUNNER_TEMP/ci-labels.yml" <<EOF
+          services:
+            ${{ matrix.service }}:
+              build:
+                labels:
+                  org.opencontainers.image.source: "https://github.com/${{ github.repository }}"
+                  org.opencontainers.image.revision: "${{ github.sha }}"
+          EOF
+
+          args=(-f "demo/${{ matrix.compose }}" -f "$RUNNER_TEMP/ci-labels.yml")
+          [[ -n "${{ matrix.profile }}" ]] && args+=(--profile "${{ matrix.profile }}")
+          printf '%s\n' "${args[@]}" > "$RUNNER_TEMP/compose-args"
+
+          docker compose "${args[@]}" config --images
+          docker compose "${args[@]}" build "${{ matrix.service }}"
+
+      - name: Push
+        run: |
+          mapfile -t args < "$RUNNER_TEMP/compose-args"
+          img="$(docker compose "${args[@]}" config --format json \
+                   | jq -r --arg s '${{ matrix.service }}' '.services[$s].image')"
+          last="${img##*/}"
+          if [[ "$last" == *:* ]]; then repo="${img%:*}"; tag="${last##*:}"; else repo="$img"; tag=latest; fi
+          sha="${GITHUB_SHA::7}"
+          if [[ "$tag" == latest ]]; then extra=("$sha"); else extra=("${tag}-${sha}"); fi
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ "$tag" == latest ]]; then extra+=("$GITHUB_REF_NAME"); else extra+=("${tag}-${GITHUB_REF_NAME}"); fi
+          fi
+
+          docker push "$img"
+          for t in "${extra[@]}"; do
+            docker tag "$img" "${repo}:${t}"
+            docker push "${repo}:${t}"
+          done
+          {
+            echo "### ${{ matrix.image }}"
+            echo '```'
+            echo "$img"; for t in "${extra[@]}"; do echo "${repo}:${t}"; done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          df -h /
