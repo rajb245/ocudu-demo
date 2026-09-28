@@ -106,11 +106,17 @@ apply_patches() { # dir | ref | patchdir
 
   echo "   ${OCUDU_BRANCH} = ${ref:0:10} + ${#patches[@]} patches"
   git -C "${repo}" checkout --quiet -B "${OCUDU_BRANCH}" "${ref}"
+  # git am records a committer and refuses to run without a git identity, which
+  # a fresh machine or a CI runner does not have. Use yours if it is set, else a
+  # placeholder; the patches keep their own authors either way.
+  local -a ident=()
+  git -C "${repo}" config user.name  >/dev/null 2>&1 || ident+=(-c "user.name=ocudu-demo bootstrap")
+  git -C "${repo}" config user.email >/dev/null 2>&1 || ident+=(-c "user.email=bootstrap@ocudu-demo.invalid")
   # -3 so the patches still apply once upstream has moved the surrounding
   # lines; a real conflict stops here rather than half-patching the tree.
-  if ! git -C "${repo}" am -3 --quiet "${patches[@]}"; then
+  if ! git -C "${repo}" ${ident[@]+"${ident[@]}"} am -3 --quiet "${patches[@]}"; then
     git -C "${repo}" am --abort >/dev/null 2>&1 || true
-    echo "   PATCHES DO NOT APPLY to ${ref:0:10}. The pin and ${patchdir} disagree." >&2
+    echo "   git am failed on ${ref:0:10} (see the message above)." >&2
     return 1
   fi
 }
